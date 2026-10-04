@@ -4,6 +4,7 @@ import { parseConversation } from './parser.js';
 import { initDatabase, getAllExchanges, getFileLastIndexed } from './db.js';
 import { getArchiveDir, getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
 import { isErroredSentinel } from './summary-sentinel.js';
+import { getRedactionSettings } from './redaction.js';
 
 export interface VerificationResult {
   missing: Array<{ path: string; reason: string }>;
@@ -160,7 +161,8 @@ export async function repairIndex(issues: VerificationResult): Promise<void> {
 
       // Generate/update summary
       const summaryPath = conversationPath.replace('.jsonl', '-summary.txt');
-      const summary = await summarizeConversation(exchanges);
+      // Under redaction, don't let the Codex fork fallback read the source rollout.
+      const summary = await summarizeConversation(exchanges, undefined, { allowResume: !getRedactionSettings().enabled });
       fs.writeFileSync(summaryPath, summary, 'utf-8');
       console.log(`  Created summary: ${summary.split(/\s+/).length} words`);
 
