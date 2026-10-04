@@ -23,6 +23,23 @@
  * docs/REDACTION.md. `episodic-memory redact --print-default-rules` dumps
  * this object as JSON.
  */
+// Names that mark the value next to them as a secret, for the key-context
+// rules below. A name must END in one of these (optionally plus digits), so
+// tokenType, secretName, passwordPolicy, TokenEndpoint and maxTokens don't
+// count. `pwd` is deliberately absent (the PWD env var); `userPWD` is handled
+// by xml-secret-attribute.
+const SECRET_NAME = String.raw `(?:secret|password|passwd|passphrase|api[_-]?key|access[_-]?key|account[_-]?key|private[_-]?key|` +
+    String.raw `shared[_-]?(?:access[_-]?)?key|primary[_-]?key|secondary[_-]?key|master[_-]?key|signing[_-]?key|` +
+    String.raw `subscription[_-]?key|client[_-]?key|encryption[_-]?key|token|credentials?)\d*`;
+// Value is not a template/placeholder: ${X} $(X) $X #{X}# {{x}} <x> %X% __X__,
+// an existing token, a type name (Swagger "string"), or a mask (*****).
+const NOT_PLACEHOLDER = String.raw `(?!\[REDACTED:|\$\{|\$\(|\$[A-Za-z_]\w*["'<\s]|#\{|\{\{|<[^>]*>|%[A-Za-z_]\w*%|__[A-Za-z0-9_]+__|` +
+    String.raw `(?:string|null|true|false|none|undefined|\*+)["'<])`;
+// A JSON string value (escapes allowed), captured.
+const JSON_STRING_VALUE = String.raw `"${NOT_PLACEHOLDER}([^"\\]+(?:\\.[^"\\]*)*)"`;
+// Sibling members inside the same object: strings, or anything but braces/quotes.
+const SAME_OBJECT = String.raw `(?:[^{}"]|"(?:[^"\\]|\\.)*"){0,400}?`;
+const KEY_VAULT_ID = String.raw `"id"[ \t]*:[ \t]*"https://[^"\s]+\.vault\.(?:azure\.net|azure\.cn|usgovcloudapi\.net|microsoftazure\.de)/secrets/[^"\s]*"`;
 export const DEFAULT_REDACTION_CONFIG = {
     rules: [
         {
@@ -34,7 +51,7 @@ export const DEFAULT_REDACTION_CONFIG = {
         {
             id: 'connection-string-secret',
             description: 'Secret value inside an Azure/ADO.NET connection string; account, server and database names are kept',
-            pattern: String.raw `\b(?:AccountKey|SharedAccessKey|SharedAccessSignature|SharedSecret|ClientSecret|Password|Pwd)[ \t]*=[ \t]*(?![\[$<{%])([^;"'\s]+)`,
+            pattern: String.raw `\b(?:AccountKey|SharedAccessKey|SharedAccessSignature|SharedSecret|ClientSecret|Password|Pwd)=(?![\[$<{%])([^;"'\s]+)`,
             secretGroup: 1,
             keywords: ['accountkey', 'sharedaccess', 'sharedsecret', 'clientsecret', 'password', 'pwd'],
         },
@@ -127,6 +144,70 @@ export const DEFAULT_REDACTION_CONFIG = {
             keywords: ['basic'],
         },
         {
+            id: 'azure-keyvault-secret',
+            description: 'The "value" of a Key Vault secret bundle (az keyvault secret show/set, SDK JSON), whatever the secret is named',
+            pattern: KEY_VAULT_ID + String.raw `(?:[^{}]|\{[^{}]*\}){0,800}?"value"[ \t]*:[ \t]*` + JSON_STRING_VALUE +
+                String.raw `|"value"[ \t]*:[ \t]*` + JSON_STRING_VALUE + String.raw `(?=(?:[^{}]|\{[^{}]*\}){0,800}?` + KEY_VAULT_ID + ')',
+            secretGroup: [1, 2],
+            useAllowlist: false,
+            keywords: ['.vault.'],
+        },
+        {
+            id: 'name-value-secret',
+            description: 'The "value" of a {"name"/"key": <secret-looking name>, "value": ...} object, in either order: ' +
+                'az webapp/functionapp config appsettings list, Kubernetes env, ARM/Bicep parameters',
+            pattern: String.raw `"(?:name|key)"[ \t]*:[ \t]*"[^"\\]{0,80}?` + SECRET_NAME + '"' + SAME_OBJECT +
+                String.raw `"value"[ \t]*:[ \t]*` + JSON_STRING_VALUE +
+                String.raw `|"value"[ \t]*:[ \t]*` + JSON_STRING_VALUE + '(?=' + SAME_OBJECT +
+                String.raw `"(?:name|key)"[ \t]*:[ \t]*"[^"\\]{0,80}?` + SECRET_NAME + '")',
+            flags: 'i',
+            secretGroup: [1, 2],
+            useAllowlist: false,
+            keywords: ['"value"'],
+        },
+        {
+            id: 'xml-appsettings-secret',
+            description: 'web.config / app.config <add key="<secret-looking name>" value="..."/>, either attribute order',
+            pattern: String.raw `<add\b[^>]*?\bkey[ \t]*=[ \t]*"[^"]{0,80}?` + SECRET_NAME + String.raw `"[^>]*?\bvalue[ \t]*=[ \t]*"` +
+                NOT_PLACEHOLDER + String.raw `([^"]+)"` +
+                String.raw `|<add\b[^>]*?\bvalue[ \t]*=[ \t]*"` + NOT_PLACEHOLDER + String.raw `([^"]+)"(?=[^>]*?\bkey[ \t]*=[ \t]*"[^"]{0,80}?` +
+                SECRET_NAME + '")',
+            flags: 'i',
+            secretGroup: [1, 2],
+            useAllowlist: false,
+            keywords: ['<add'],
+        },
+        {
+            id: 'xml-secret-element',
+            description: 'Text of an XML element with a secret-looking name (ClientSecret, Password, ApiKey, ...)',
+            pattern: String.raw `<((?=[A-Za-z_])[\w.:-]{0,60}?` + SECRET_NAME + String.raw `)(?:\s[^>]*)?>` + NOT_PLACEHOLDER + String.raw `([^<]{1,4096})</\1>`,
+            flags: 'i',
+            secretGroup: 2,
+            useAllowlist: false,
+            keywords: ['</'],
+        },
+        {
+            id: 'xml-secret-attribute',
+            description: 'XML/HTML attribute with a secret-looking name, e.g. userPWD="..." in Azure publish profiles',
+            pattern: String.raw `(?<=[\s<])(?=[A-Za-z_])[\w.:-]{0,60}?(?:` + SECRET_NAME + String.raw `|pwd\d*)="(?![/~])` +
+                NOT_PLACEHOLDER + String.raw `([^"]{4,})"`,
+            flags: 'i',
+            secretGroup: 1,
+            useAllowlist: false,
+            keywords: ['="'],
+        },
+        {
+            id: 'quoted-secret-assignment',
+            description: 'Quoted value assigned to a secret-looking name: "ClientSecret": "...", ClientSecret = "...", ' +
+                "password: '...' (JSON/appsettings, C#, JS/TS, Python, YAML). No digit required; no whitespace in the value",
+            pattern: String.raw `(?<![\w.$@-])["']?(?=[A-Za-z_$@])[\w.:$@-]{0,60}?` + SECRET_NAME +
+                String.raw `["']?[ \t]*(?::=|[:=])[ \t]*(["'])` + NOT_PLACEHOLDER + String.raw `([^"'\s\\]{4,512})\1`,
+            flags: 'i',
+            secretGroup: 2,
+            useAllowlist: false,
+            keywords: ['secret', 'passw', 'passphrase', 'key', 'token', 'credential'],
+        },
+        {
             id: 'secret-assignment',
             description: 'Value assigned to a secret-looking key (password: x, CLIENT_SECRET=x, "apiKey": "x"). ' +
                 'Covers decrypted SOPS/YAML/dotenv/JSON. Requires 8+ chars including a digit; ' +
@@ -160,5 +241,13 @@ export const DEFAULT_REDACTION_CONFIG = {
         requireKeyword: true,
         keywords: ['secret', 'key', 'token', 'password', 'passwd', 'credential', 'signature'],
         window: 40,
+    },
+    secretFields: {
+        enabled: true,
+        // Normalized key (lowercase letters/digits only, trailing digits dropped)
+        // must end with one of these. Harness keys (signature, apiKeySource,
+        // input_tokens, token_count) don't.
+        keyPattern: 'secret|password|passwd|userpwd|passphrase|apikey|accesskey|accountkey|privatekey|sharedkey|primarykey|' +
+            'secondarykey|masterkey|signingkey|subscriptionkey|clientkey|encryptionkey|token|credentials?',
     },
 };

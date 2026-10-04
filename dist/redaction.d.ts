@@ -27,8 +27,13 @@ export interface RedactionRuleSpec {
     flags?: string;
     /** Case-insensitive prefilter: skip the rule unless the text contains one. */
     keywords?: string[];
-    /** Replace only this capture group instead of the whole match. */
-    secretGroup?: number;
+    /**
+     * Replace only this capture group instead of the whole match. An array means
+     * "the first of these groups that participated" (for either-order patterns).
+     */
+    secretGroup?: number | number[];
+    /** Apply the allowlist to this rule's matches (default true). Key-context rules turn it off: a GUID in a password slot is a secret. */
+    useAllowlist?: boolean;
     description?: string;
 }
 export interface AllowlistSpec {
@@ -49,10 +54,26 @@ export interface EntropySpec {
     /** How many characters before the candidate to search for a keyword. */
     window: number;
 }
+/**
+ * Field-name context for parsed JSON (transcript lines, structured tool/MCP
+ * results, tool inputs). A string value is redacted whole when its own key, or
+ * the `name`/`key` of a `{name, value}` pair, matches `keyPattern`.
+ */
+export interface SecretFieldsSpec {
+    enabled: boolean;
+    /**
+     * Matched (anchored at the end) against the key lowercased with everything
+     * but letters and digits removed and trailing digits dropped, so
+     * `AzureAd:ClientSecret`, `client_secret` and `DB_PASSWORD2` all normalize to
+     * something ending in a keyword.
+     */
+    keyPattern: string;
+}
 export interface RedactionConfig {
     rules: RedactionRuleSpec[];
     allowlist: AllowlistSpec[];
     entropy: EntropySpec;
+    secretFields: SecretFieldsSpec;
 }
 /** Shape of a user `redaction-rules.json`. Every field is optional. */
 export interface RedactionRulesFile {
@@ -65,6 +86,7 @@ export interface RedactionRulesFile {
     /** Added to the default allowlist (same id replaces). */
     allowlist?: AllowlistSpec[];
     entropy?: Partial<EntropySpec>;
+    secretFields?: Partial<SecretFieldsSpec>;
 }
 export interface RedactionContext {
     source: string;
@@ -81,6 +103,8 @@ export interface RedactionResult {
 export interface Redactor {
     redact(text: string, ctx?: RedactionContext): RedactionResult;
     readonly ruleIds: string[];
+    /** True when a JSON key / setting name marks its value as a secret (secretFields). */
+    isSecretField(name: string): boolean;
 }
 export interface RedactionSettings {
     enabled: boolean;

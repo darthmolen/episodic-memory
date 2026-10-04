@@ -292,6 +292,43 @@ describe('redaction pipeline', () => {
     expect(summarizeSpy.mock.calls[0][2]).toMatchObject({ allowResume: true });
   });
 
+  it('.NET/Azure key-context secrets (no recognizable shape) never reach archive or SQLite', async () => {
+    const fake = new FakeSecrets(1999);
+    const appsettingsSecret = fake.passphrase();
+    const appSettingValue = fake.passphrase();
+    const vaultValue = fake.passphrase();
+    const mcpSecret = fake.passphrase();
+    const seed: Seed = { secrets: [appsettingsSecret, appSettingValue, vaultValue, mcpSecret], sha: fake.gitSha(), guid: fake.guid() };
+    const base = { sessionId: SESSION, isSidechain: false, cwd: '/work/contoso' };
+    const lines = [
+      { ...base, type: 'user', uuid: 'u1', parentUuid: null, timestamp: '2026-01-01T00:00:00Z', message: { role: 'user', content: 'Why does the API fail to get a token?' } },
+      { ...base, type: 'assistant', uuid: 'a1', parentUuid: 'u1', timestamp: '2026-01-01T00:00:01Z', message: { role: 'assistant', content: [
+        { type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/work/contoso/appsettings.Development.json' } },
+      ] } },
+      { ...base, type: 'user', uuid: 'u2', parentUuid: 'a1', timestamp: '2026-01-01T00:00:02Z',
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: JSON.stringify({ AzureAd: { TenantId: seed.guid, ClientSecret: appsettingsSecret } }, null, 2) }] } },
+      { ...base, type: 'assistant', uuid: 'a2', parentUuid: 'u2', timestamp: '2026-01-01T00:00:03Z', message: { role: 'assistant', content: [
+        { type: 'tool_use', id: 't2', name: 'Bash', input: { command: 'az webapp config appsettings list -g rg -n app && az keyvault secret show --vault-name kv -n Db' } },
+      ] } },
+      { ...base, type: 'user', uuid: 'u3', parentUuid: 'a2', timestamp: '2026-01-01T00:00:04Z',
+        message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content:
+          JSON.stringify([{ name: 'Stripe__ApiKey', slotSetting: false, value: appSettingValue }], null, 2) + '\n' +
+          JSON.stringify({ id: 'https://kv.vault.azure.net/secrets/Db/0123', value: vaultValue }, null, 2) }] },
+        toolUseResult: { structuredContent: { name: 'GraphClientSecret', value: mcpSecret } } },
+      { ...base, type: 'assistant', uuid: 'a3', parentUuid: 'u3', timestamp: '2026-01-01T00:00:05Z', message: { role: 'assistant', content: [{ type: 'text', text: 'The client secret has expired.' }] } },
+    ];
+    writeFileSync(join(sourceDir, '-work-contoso', `${SESSION}.jsonl`), lines.map(l => JSON.stringify(l)).join('\n') + '\n');
+
+    const result = await syncConversations(sourceDir, archiveDir, { skipSummaries: true });
+    expect(result.errors).toEqual([]);
+    const archived = readFileSync(join(archiveDir, '-work-contoso', `${SESSION}.jsonl`), 'utf-8');
+    expectNoSecrets(archived, seed, 'archive');
+    expectNoSecrets(dbText(dbPath), seed, 'SQLite');
+    expectNoSecrets(JSON.stringify(embedSpy.mock.calls), seed, 'embedding input');
+    expect(archived).toContain(seed.guid);
+    archived.split('\n').filter(Boolean).forEach(l => expect(() => JSON.parse(l)).not.toThrow());
+  });
+
   it('the `index` path (indexUnprocessed) parses the redacted archive, not the source', async () => {
     const s = seedSecrets(77);
     writeFileSync(join(sourceDir, '-work-contoso', `${SESSION}.jsonl`), claudeTranscript(s));

@@ -113,7 +113,12 @@ export class FakeSecrets {
     return this.chars(LOWER, 1) + this.mixed(ALNUM + '!#%^*', 15);
   }
 
-  bearerOpaque(): string {
+  /** Letters only: a real password with no digit, which digit-gated rules miss. */
+  passphrase(): string {
+    return this.chars(UPPER, 1) + this.chars(LOWER, 7) + this.chars(UPPER, 1) + this.chars(LOWER, 9);
+  }
+
+    bearerOpaque(): string {
     return this.mixed(ALNUM, 40);
   }
 
