@@ -187,9 +187,9 @@ describe('redaction: default rules (positive)', () => {
     expect(redactor.redact(yaml, ctx).text).toContain('host: db.internal');
   });
 
-  it('secret-assignment redacts a JSON "clientSecret" field', () => {
+  it('quoted-secret-assignment redacts a JSON "clientSecret" field', () => {
     const secret = fake.password();
-    expectRedacted(redactor, JSON.stringify({ clientId: fake.guid(), clientSecret: secret }), secret, 'secret-assignment');
+    expectRedacted(redactor, JSON.stringify({ clientId: fake.guid(), clientSecret: secret }), secret, 'quoted-secret-assignment');
   });
 });
 
@@ -522,5 +522,166 @@ describe('redaction: settings and rules loading', () => {
     } catch (e) {
       expect((e as Error).message).toContain('x');
     }
+  });
+});
+
+describe('redaction: key context (.NET / Azure shapes)', () => {
+  let fake: FakeSecrets;
+  let redactor: Redactor;
+  beforeEach(() => {
+    fake = new FakeSecrets(2112);
+    redactor = defaults();
+  });
+
+  function expectGone(text: string, secret: string, ruleId?: string) {
+    const result = redactor.redact(text, ctx);
+    expect(result.text, text).not.toContain(secret);
+    if (ruleId) expect(result.text).toContain(`[REDACTED:${ruleId}]`);
+    return result;
+  }
+
+  it('appsettings.json fields, no digit required when the key is quoted JSON', () => {
+    const pw = fake.passphrase();
+    const text = JSON.stringify({ AzureAd: { TenantId: fake.guid(), ClientId: fake.guid(), ClientSecret: pw } }, null, 2);
+    const r = expectGone(text, pw, 'quoted-secret-assignment');
+    expect(r.text).toContain('"TenantId"');
+  });
+
+  it('C# object initializers and locals', () => {
+    const a = fake.passphrase();
+    const b = fake.passphrase();
+    expectGone(`var cred = new ClientSecretCredential(tenant, client) { ClientSecret = "${a}", };`, a, 'quoted-secret-assignment');
+    expectGone(`string apiKey = "${b}";`, b, 'quoted-secret-assignment');
+  });
+
+  it('`az webapp config appsettings list` name/value pairs (name first and value first)', () => {
+    const a = fake.passphrase();
+    const b = fake.passphrase();
+    const text = JSON.stringify([
+      { name: 'WEBSITE_RUN_FROM_PACKAGE', slotSetting: false, value: '1' },
+      { name: 'Stripe__ApiKey', slotSetting: false, value: a },
+      { value: b, slotSetting: true, name: 'DB_PASSWORD' },
+    ], null, 2);
+    const r = expectGone(text, a, 'name-value-secret');
+    expect(r.text).not.toContain(b);
+    expect(r.text).toContain('WEBSITE_RUN_FROM_PACKAGE');
+    expect(r.text).toContain('"value": "1"');
+  });
+
+  it('Kubernetes env entries', () => {
+    const a = fake.passphrase();
+    expectGone(`env:\n  - {"name": "ConnectionStrings__Redis", "value": "redis:6380"}\n  - {"name": "JWT_SIGNING_KEY", "value": "${a}"}`, a);
+  });
+
+  it('`az keyvault secret show` value (any secret name, nested attributes)', () => {
+    const a = fake.passphrase();
+    const text = JSON.stringify({
+      attributes: { created: '2026-01-01T00:00:00+00:00', enabled: true, recoveryLevel: 'Recoverable' },
+      contentType: null,
+      id: 'https://contoso-kv.vault.azure.net/secrets/StorageThing/0123456789abcdef0123456789abcdef',
+      name: 'StorageThing',
+      tags: {},
+      value: a,
+    }, null, 2);
+    const r = expectGone(text, a, 'azure-keyvault-secret');
+    expect(r.text).toContain('contoso-kv.vault.azure.net/secrets/StorageThing');
+  });
+
+  it('web.config appSettings in either attribute order', () => {
+    const a = fake.passphrase();
+    const b = fake.passphrase();
+    expectGone(`<appSettings>\n  <add key="SendGridApiKey" value="${a}" />\n  <add value="${b}" key="AdminPassword"/>\n  <add key="Environment" value="Production" />\n</appSettings>`, a, 'xml-appsettings-secret');
+    const r = redactor.redact(`<add value="${b}" key="AdminPassword"/>`, ctx);
+    expect(r.text).not.toContain(b);
+    expect(redactor.redact('<add key="Environment" value="Production" />', ctx).findings).toEqual([]);
+  });
+
+  it('publish profiles and XML secret attributes/elements', () => {
+    const a = fake.passphrase();
+    const b = fake.passphrase();
+    const r = expectGone(`<publishProfile profileName="app - Web Deploy" userName="$contoso-app" userPWD="${a}" destinationAppUrl="https://contoso-app.azurewebsites.net" />`, a, 'xml-secret-attribute');
+    expect(r.text).toContain('userName="$contoso-app"');
+    expect(r.text).toContain('https://contoso-app.azurewebsites.net');
+    expectGone(`<Credentials><ClientSecret>${b}</ClientSecret></Credentials>`, b, 'xml-secret-element');
+  });
+
+  it('a GUID in a password slot is redacted (legacy create-for-rbac), but GUID IDs elsewhere are kept', () => {
+    const pw = fake.guid();
+    const tenant = fake.guid();
+    const r = expectGone(JSON.stringify({ appId: fake.guid(), password: pw, tenant }), pw);
+    expect(r.text).toContain(tenant);
+  });
+
+  it('leaves placeholders, labels and non-secret neighbours alone', () => {
+    const untouched = [
+      '{"ClientSecret": "#{ClientSecret}#", "ApiKey": "__API_KEY__", "Password": "$(DbPassword)", "Token": "${TOKEN}", "Secret": "<your-secret>"}',
+      'ErrorMessage = "Invalid password or username";',
+      '{"tokenType": "Bearer", "secretName": "db-password", "maxTokens": "4096", "passwordPolicy": "strict"}',
+      'options.Password = configuration["Db:Password"];',
+      '<add key="Environment" value="Production" />',
+      '{"name": "TokenEndpoint", "value": "https://login.microsoftonline.com/common/oauth2/v2.0/token"}',
+      '<UserSecretsId>' + 'a1b2c3d4-0000-1111-2222-333344445555' + '</UserSecretsId>',
+      'PWD="/home/user1/src"',
+    ];
+    for (const text of untouched) {
+      const r = redactor.redact(text, ctx);
+      expect(r.findings, text).toEqual([]);
+    }
+  });
+});
+
+describe('redaction: structured JSON (field names as context, keys redacted)', () => {
+  const redactor = createRedactor(DEFAULT_REDACTION_CONFIG);
+  const fake = new FakeSecrets(4242);
+
+  it('redacts a value whose own field name is secret-looking, with no shape match', () => {
+    const pw = fake.passphrase();
+    const line = JSON.stringify({ type: 'user', toolUseResult: { structuredContent: { clientId: 'app', clientSecret: pw } } });
+    const out = redactJsonlLine(line, redactor, ctx);
+    expect(out).not.toContain(pw);
+    expect(JSON.parse(out).toolUseResult.structuredContent).toEqual({ clientId: 'app', clientSecret: '[REDACTED:secret-field]' });
+  });
+
+  it('redacts the value of a {name, value} object whose name is secret-looking', () => {
+    const pw = fake.passphrase();
+    const line = JSON.stringify({ result: [{ name: 'Db__Password', value: pw }, { name: 'Region', value: 'eastus' }] });
+    const out = JSON.parse(redactJsonlLine(line, redactor, ctx));
+    expect(out.result).toEqual([{ name: 'Db__Password', value: '[REDACTED:secret-field]' }, { name: 'Region', value: 'eastus' }]);
+  });
+
+  it('redacts a structured Key Vault secret bundle value', () => {
+    const pw = fake.passphrase();
+    const line = JSON.stringify({ result: { id: 'https://kv.vault.azure.net/secrets/Anything/1', value: pw, attributes: { enabled: true } } });
+    expect(redactJsonlLine(line, redactor, ctx)).not.toContain(pw);
+  });
+
+  it('redacts secrets used as object keys', () => {
+    const token = fake.githubToken();
+    const line = JSON.stringify({ cache: { [token]: { user: 'octocat' } } });
+    const out = redactJsonlLine(line, redactor, ctx);
+    expect(out).not.toContain(token);
+    expect(JSON.parse(out).cache['[REDACTED:github-token]']).toEqual({ user: 'octocat' });
+  });
+
+  it('leaves harness structure alone (thinking signatures, usage, token_count, apiKeySource)', () => {
+    const lines = [
+      JSON.stringify({ type: 'assistant', message: { content: [{ type: 'thinking', thinking: 'hmm', signature: fake.base64Blob(200) }], usage: { input_tokens: 12, output_tokens: 3 } } }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1 } } } }),
+      JSON.stringify({ type: 'system', subtype: 'init', apiKeySource: 'none', tokenizer: 'cl100k' }),
+      JSON.stringify({ secretName: 'db-password', passwordPolicy: 'strict', password: '${DB_PASSWORD}', token: '' }),
+    ];
+    for (const line of lines) expect(redactJsonlLine(line, redactor, ctx), line).toBe(line);
+  });
+
+  it('is idempotent on structured redactions', () => {
+    const line = JSON.stringify({ a: { clientSecret: fake.passphrase() }, b: [{ name: 'API_KEY', value: fake.passphrase() }] });
+    const once = redactJsonlLine(line, redactor, ctx);
+    expect(redactJsonlLine(once, redactor, ctx)).toBe(once);
+  });
+
+  it('can be turned off via secretFields.enabled=false', () => {
+    const r = createRedactor({ ...DEFAULT_REDACTION_CONFIG, secretFields: { ...DEFAULT_REDACTION_CONFIG.secretFields, enabled: false } });
+    const pw = fake.passphrase();
+    expect(redactJsonlLine(JSON.stringify({ x: { clientSecret: pw } }), r, ctx)).toContain(pw);
   });
 });

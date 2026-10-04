@@ -34,6 +34,13 @@ const TOKEN_PATTERN = /\[REDACTED:[a-z0-9][a-z0-9-]*\]/g;
 const TOKEN_PREFIX = '[REDACTED:';
 const ALLOWED_FLAGS = /^[imsu]*$/;
 const ENTROPY_RULE_ID = 'high-entropy';
+const FIELD_RULE_ID = 'secret-field';
+const RESERVED_IDS = new Set([ENTROPY_RULE_ID, FIELD_RULE_ID]);
+
+/** Values that are templates or type names, not secrets. Never redacted by field context. */
+const PLACEHOLDER_VALUE =
+  /^(?:\$\{.*\}|\$\(.*\)|\$[A-Za-z_]\w*|#\{.*\}#?|\{\{.*\}\}|<[^>]*>|%[A-Za-z_]\w*%|__[A-Za-z0-9_]+__|string|null|true|false|none|undefined|\*+)$/i;
+const KEY_VAULT_SECRET_ID = /^https:\/\/[^/\s]+\.vault\.(?:azure\.net|azure\.cn|usgovcloudapi\.net|microsoftazure\.de)\/secrets\//i;
 
 export interface RedactionRuleSpec {
   id: string;
@@ -42,8 +49,13 @@ export interface RedactionRuleSpec {
   flags?: string;
   /** Case-insensitive prefilter: skip the rule unless the text contains one. */
   keywords?: string[];
-  /** Replace only this capture group instead of the whole match. */
-  secretGroup?: number;
+  /**
+   * Replace only this capture group instead of the whole match. An array means
+   * "the first of these groups that participated" (for either-order patterns).
+   */
+  secretGroup?: number | number[];
+  /** Apply the allowlist to this rule's matches (default true). Key-context rules turn it off: a GUID in a password slot is a secret. */
+  useAllowlist?: boolean;
   description?: string;
 }
 
@@ -67,10 +79,27 @@ export interface EntropySpec {
   window: number;
 }
 
+/**
+ * Field-name context for parsed JSON (transcript lines, structured tool/MCP
+ * results, tool inputs). A string value is redacted whole when its own key, or
+ * the `name`/`key` of a `{name, value}` pair, matches `keyPattern`.
+ */
+export interface SecretFieldsSpec {
+  enabled: boolean;
+  /**
+   * Matched (anchored at the end) against the key lowercased with everything
+   * but letters and digits removed and trailing digits dropped, so
+   * `AzureAd:ClientSecret`, `client_secret` and `DB_PASSWORD2` all normalize to
+   * something ending in a keyword.
+   */
+  keyPattern: string;
+}
+
 export interface RedactionConfig {
   rules: RedactionRuleSpec[];
   allowlist: AllowlistSpec[];
   entropy: EntropySpec;
+  secretFields: SecretFieldsSpec;
 }
 
 /** Shape of a user `redaction-rules.json`. Every field is optional. */
@@ -84,6 +113,7 @@ export interface RedactionRulesFile {
   /** Added to the default allowlist (same id replaces). */
   allowlist?: AllowlistSpec[];
   entropy?: Partial<EntropySpec>;
+  secretFields?: Partial<SecretFieldsSpec>;
 }
 
 export interface RedactionContext {
@@ -104,6 +134,8 @@ export interface RedactionResult {
 export interface Redactor {
   redact(text: string, ctx?: RedactionContext): RedactionResult;
   readonly ruleIds: string[];
+  /** True when a JSON key / setting name marks its value as a secret (secretFields). */
+  isSecretField(name: string): boolean;
 }
 
 export interface RedactionSettings {
@@ -197,8 +229,10 @@ export function loadRedactionConfig(file: RedactionRulesFile): RedactionConfig {
       throw new RedactionConfigError(`Redaction rules file: "${key}" must be an array`);
     }
   }
-  if (file.entropy !== undefined && (typeof file.entropy !== 'object' || file.entropy === null)) {
-    throw new RedactionConfigError('Redaction rules file: "entropy" must be an object');
+  for (const key of ['entropy', 'secretFields'] as const) {
+    if (file[key] !== undefined && (typeof file[key] !== 'object' || file[key] === null || Array.isArray(file[key]))) {
+      throw new RedactionConfigError(`Redaction rules file: "${key}" must be an object`);
+    }
   }
 
   const includeDefaults = file.includeDefaults !== false;
@@ -210,6 +244,7 @@ export function loadRedactionConfig(file: RedactionRulesFile): RedactionConfig {
     rules: replaceById(baseRules, file.rules ?? []).filter(rule => !disabled.has(rule.id)),
     allowlist: replaceById(baseAllowlist, file.allowlist ?? []),
     entropy: { ...DEFAULT_REDACTION_CONFIG.entropy, ...(file.entropy ?? {}) },
+    secretFields: { ...DEFAULT_REDACTION_CONFIG.secretFields, ...(file.secretFields ?? {}) },
   };
   compileConfig(config); // validate
   return config;
@@ -251,13 +286,16 @@ interface CompiledRule {
   id: string;
   regex: RegExp;
   keywords?: string[];
-  secretGroup: number;
+  secretGroups: number[];
+  useAllowlist: boolean;
 }
 
 interface CompiledConfig {
   rules: CompiledRule[];
   allowlist: RegExp[];
   entropy: EntropySpec;
+  /** null when secretFields is disabled. */
+  secretField: RegExp | null;
 }
 
 function checkFlags(flags: string | undefined, what: string): string {
@@ -277,8 +315,8 @@ function compileRule(spec: RedactionRuleSpec): CompiledRule {
       `Redaction rule id ${JSON.stringify(spec.id)} is invalid: use lowercase letters, digits and dashes`
     );
   }
-  if (spec.id === ENTROPY_RULE_ID) {
-    throw new RedactionConfigError(`Redaction rule id "${ENTROPY_RULE_ID}" is reserved`);
+  if (RESERVED_IDS.has(spec.id)) {
+    throw new RedactionConfigError(`Redaction rule id "${spec.id}" is reserved`);
   }
   const what = `Redaction rule "${spec.id}"`;
   if (typeof spec.pattern !== 'string' || spec.pattern.length === 0) {
@@ -298,9 +336,17 @@ function compileRule(spec: RedactionRuleSpec): CompiledRule {
     throw new RedactionConfigError(`${what}: pattern matches the empty string`);
   }
 
-  const secretGroup = spec.secretGroup ?? 0;
-  if (!Number.isInteger(secretGroup) || secretGroup < 0 || secretGroup > groupCount) {
-    throw new RedactionConfigError(`${what}: secretGroup ${secretGroup} does not exist in the pattern (${groupCount} group(s))`);
+  const secretGroups = Array.isArray(spec.secretGroup) ? spec.secretGroup : [spec.secretGroup ?? 0];
+  if (secretGroups.length === 0) {
+    throw new RedactionConfigError(`${what}: secretGroup must not be an empty array`);
+  }
+  for (const group of secretGroups) {
+    if (!Number.isInteger(group) || group < 0 || group > groupCount) {
+      throw new RedactionConfigError(`${what}: secretGroup ${group} does not exist in the pattern (${groupCount} group(s))`);
+    }
+  }
+  if (spec.useAllowlist !== undefined && typeof spec.useAllowlist !== 'boolean') {
+    throw new RedactionConfigError(`${what}: useAllowlist must be a boolean`);
   }
 
   let keywords: string[] | undefined;
@@ -311,7 +357,7 @@ function compileRule(spec: RedactionRuleSpec): CompiledRule {
     keywords = spec.keywords.length > 0 ? spec.keywords.map(k => k.toLowerCase()) : undefined;
   }
 
-  return { id: spec.id, regex, keywords, secretGroup };
+  return { id: spec.id, regex, keywords, secretGroups, useAllowlist: spec.useAllowlist !== false };
 }
 
 function compileAllowlist(spec: AllowlistSpec): RegExp {
@@ -349,7 +395,21 @@ function compileConfig(config: RedactionConfig): CompiledConfig {
       'Redaction entropy settings are invalid (need enabled, requireKeyword: boolean; minLength >= 8; threshold > 0; window >= 0; keywords: string[])'
     );
   }
-  return { rules, allowlist, entropy: { ...e, keywords: e.keywords.map(k => k.toLowerCase()) } };
+  const f = config.secretFields;
+  if (!f || typeof f.enabled !== 'boolean' || typeof f.keyPattern !== 'string' || f.keyPattern.length === 0) {
+    throw new RedactionConfigError('Redaction secretFields settings are invalid (need enabled: boolean; keyPattern: non-empty string)');
+  }
+  let secretField: RegExp | null = null;
+  if (f.enabled) {
+    try {
+      secretField = new RegExp(`(?:${f.keyPattern})$`);
+    } catch (error) {
+      throw new RedactionConfigError(`Redaction secretFields.keyPattern: invalid regular expression (${error instanceof Error ? error.message : String(error)})`);
+    }
+    if (secretField.test('')) throw new RedactionConfigError('Redaction secretFields.keyPattern matches the empty string');
+  }
+
+  return { rules, allowlist, entropy: { ...e, keywords: e.keywords.map(k => k.toLowerCase()) }, secretField };
 }
 
 // ---------------------------------------------------------------------------
@@ -394,12 +454,16 @@ function applyRule(text: string, rule: CompiledRule, isAllowed: (s: string) => b
   let last = 0;
   let count = 0;
   for (const m of text.matchAll(rule.regex)) {
-    const range = m.indices?.[rule.secretGroup];
+    let range: [number, number] | undefined;
+    for (const group of rule.secretGroups) {
+      range = m.indices?.[group];
+      if (range) break;
+    }
     if (!range) continue;
     const [start, end] = range;
     if (end <= start || start < last) continue;
     if (spans && overlapsAny(spans, start, end)) continue;
-    if (isAllowed(text.slice(start, end))) continue;
+    if (rule.useAllowlist && isAllowed(text.slice(start, end))) continue;
     out += text.slice(last, start) + token;
     last = end;
     count++;
@@ -438,6 +502,11 @@ export function createRedactor(config: RedactionConfig): Redactor {
 
   return {
     ruleIds: compiled.rules.map(r => r.id),
+    isSecretField(name: string): boolean {
+      if (!compiled.secretField || typeof name !== 'string') return false;
+      const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/\d+$/, '');
+      return normalized.length > 0 && compiled.secretField.test(normalized);
+    },
     redact(text: string, _ctx?: RedactionContext): RedactionResult {
       if (typeof text !== 'string' || text.length === 0) return { text, findings: [] };
       let current = text;
@@ -508,7 +577,10 @@ export function formatFindings(findings: RedactionFinding[]): string {
 // JSON / JSONL / files
 // ---------------------------------------------------------------------------
 
-/** Redact every string value in a parsed JSON tree, in place. Keys are left alone. */
+/**
+ * Redact a parsed JSON tree in place: string values by the text rules, values
+ * by their field name (secretFields), and keys that are themselves secrets.
+ */
 function redactTree(
   node: unknown,
   redactor: Redactor,
@@ -532,14 +604,75 @@ function redactTree(
     return { value: node, changed };
   }
   const obj = node as Record<string, unknown>;
-  for (const key of Object.keys(obj)) {
+  const keys = Object.keys(obj);
+  for (const key of keys) {
     const r = redactTree(obj[key], redactor, ctx, tally);
     if (r.changed) {
-      Object.defineProperty(obj, key, { value: r.value, writable: true, enumerable: true, configurable: true });
+      setOwn(obj, key, r.value);
       changed = true;
     }
   }
+
+  // Field-name context: the key (or a {name, value} pair's name, or a Key
+  // Vault secret id) says the value is a secret even when its shape matches
+  // no rule — e.g. a letters-only clientSecret field in a structured
+  // MCP result. Runs after the text rules, so a value they already redacted
+  // in part (a connection string) keeps its searchable remainder.
+  const redactWhole = (key: string) => {
+    if (!isRedactableWhole(obj[key])) return;
+    setOwn(obj, key, tokenFor(FIELD_RULE_ID));
+    tally?.add([{ ruleId: FIELD_RULE_ID, count: 1 }]);
+    changed = true;
+  };
+  for (const key of keys) {
+    if (redactor.isSecretField(key)) redactWhole(key);
+  }
+  const lower = new Map(keys.map(k => [k.toLowerCase(), k]));
+  const valueKey = lower.get('value');
+  if (valueKey !== undefined) {
+    const nameKey = lower.get('name') ?? lower.get('key');
+    const nameValue = nameKey !== undefined ? obj[nameKey] : undefined;
+    const id = lower.has('id') ? obj[lower.get('id')!] : undefined;
+    if (
+      (typeof nameValue === 'string' && redactor.isSecretField(nameValue)) ||
+      (typeof id === 'string' && KEY_VAULT_SECRET_ID.test(id))
+    ) {
+      redactWhole(valueKey);
+    }
+  }
+
+  // Keys themselves: a secret used as a key (a token-keyed cache) is renamed
+  // to its token. Harness keys never match a rule, so structure is unchanged.
+  let renamed: Array<[string, unknown]> | null = null;
+  for (let i = 0; i < keys.length; i++) {
+    const r = redactor.redact(keys[i], ctx);
+    if (r.findings.length === 0) continue;
+    tally?.add(r.findings);
+    renamed ??= keys.map(k => [k, obj[k]]);
+    renamed[i][0] = r.text;
+  }
+  if (renamed) {
+    const rebuilt: Record<string, unknown> = {};
+    for (const [key, value] of renamed) {
+      let unique = key;
+      for (let n = 2; Object.prototype.hasOwnProperty.call(rebuilt, unique); n++) unique = `${key}#${n}`;
+      setOwn(rebuilt, unique, value);
+    }
+    return { value: rebuilt, changed: true };
+  }
   return { value: obj, changed };
+}
+
+function setOwn(obj: Record<string, unknown>, key: string, value: unknown): void {
+  // defineProperty so a "__proto__" key from JSON.parse stays an own property.
+  Object.defineProperty(obj, key, { value, writable: true, enumerable: true, configurable: true });
+}
+
+function isRedactableWhole(value: unknown): value is string {
+  return typeof value === 'string' &&
+    value.trim().length > 0 &&
+    !value.includes(TOKEN_PREFIX) &&
+    !PLACEHOLDER_VALUE.test(value.trim());
 }
 
 /**

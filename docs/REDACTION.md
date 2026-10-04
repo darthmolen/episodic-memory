@@ -4,9 +4,10 @@ episodic-memory replaces secrets in your conversations with typed tokens
 **before** it archives, indexes, embeds, or summarizes them:
 
 ```
-AccountKey=Zm9v...==      →  AccountKey=[REDACTED:connection-string-secret]
-"password": "abc1Q~..."   →  "password": "[REDACTED:azure-client-secret]"
-Authorization: Bearer eyJ →  Authorization: Bearer [REDACTED:jwt]
+AccountKey=<88-char key>          →  AccountKey=[REDACTED:connection-string-secret]
+"ClientSecret": "<any value>"     →  "ClientSecret": "[REDACTED:quoted-secret-assignment]"
+<add key="SmtpPassword" value=…/> →  <add key="SmtpPassword" value="[REDACTED:xml-appsettings-secret]"/>
+Authorization: Bearer <JWT>       →  Authorization: Bearer [REDACTED:jwt]
 ```
 
 Values are redacted, not dropped. The rest of the conversation stays
@@ -56,11 +57,32 @@ summary:
 | `azure-storage-key` | Standalone 88-character base64 keys (Storage, Cosmos DB, Function keys) |
 | `url-credentials` | The password in `scheme://user:password@host` |
 | `bearer-token`, `basic-auth` | `Authorization` header values |
-| `secret-assignment` | A value assigned to a secret-looking key: `password: …`, `CLIENT_SECRET=…`, `"apiKey": "…"`. Covers decrypted SOPS, YAML, dotenv, and JSON. Needs 8+ characters including a digit, and skips placeholders (`${X}`, `<x>`, `%X%`) and code (`env.X`, `getPassword()`). |
+| `azure-keyvault-secret` | The `value` of a Key Vault secret bundle (`az keyvault secret show`, SDK JSON), whatever the secret is named |
+| `name-value-secret` | The `value` of a `{"name": <secret-looking name>, "value": …}` object, in either order: `az webapp`/`functionapp config appsettings list`, Kubernetes `env`, ARM/Bicep parameters |
+| `xml-appsettings-secret` | `web.config` / `app.config` `<add key="<secret-looking name>" value="…"/>`, either attribute order |
+| `xml-secret-element` | `<ClientSecret>…</ClientSecret>`, `<Password>…</Password>` and the like |
+| `xml-secret-attribute` | Secret-named XML attributes, e.g. `userPWD="…"` in Azure publish profiles |
+| `quoted-secret-assignment` | A **quoted** value assigned to a secret-looking name: `"ClientSecret": "…"` (appsettings.json and any JSON in tool output), `ClientSecret = "…"` (C#), `apiKey: '…'` (JS/YAML/Python). No digit or minimum entropy is required; the value must have no spaces. |
+| `secret-assignment` | An **unquoted** value assigned to a secret-looking key: `password: …`, `CLIENT_SECRET=…`. Covers decrypted SOPS, YAML, and dotenv. Needs 8+ characters including a digit, and skips code (`env.X`, `getPassword()`). |
+| `secret-field` | Not a text rule: in parsed JSON (transcript lines, structured MCP/tool results, tool inputs), a string whose **field name** is secret-looking, or the `value` of a `{name, value}` pair or Key Vault bundle, is redacted whole. See `secretFields` below. |
 
-**Allowlisted** (never redacted, even when a rule matches): git SHAs and
-GUIDs. Tenant, client, object, and subscription IDs stay searchable, and so do
-commit hashes.
+A **secret-looking name** ends in `secret`, `password`, `passwd`,
+`passphrase`, `apikey`, `accesskey`, `accountkey`, `privatekey`, `sharedkey`,
+`primarykey`, `secondarykey`, `masterkey`, `signingkey`, `subscriptionkey`,
+`clientkey`, `encryptionkey`, `token`, or `credential(s)`, in any case and
+with any separators (`AzureAd:ClientSecret`, `Stripe__ApiKey`, `DB_PASSWORD2`).
+Because it has to *end* in one of these, `TokenEndpoint`, `secretName`,
+`passwordPolicy`, `tokenType`, and `maxTokens` don't count.
+
+Key-context rules leave **placeholders** alone: `${X}`, `$(X)`, `#{X}#`
+(Azure DevOps token replacement), `{{x}}`, `<x>`, `%X%`, `__X__`, and type
+names or masks like `"string"` and `"*****"`. All other rules skip the same
+`${X}`, `<x>`, and `%X%` forms.
+
+**Allowlisted:** git SHAs and GUIDs are not redacted by shape-based rules,
+so tenant, client, object, and subscription IDs and commit hashes stay
+searchable. Key-context rules ignore the allowlist on purpose: a GUID in a
+`password` slot (older `az ad sp create-for-rbac` output) *is* a secret.
 
 **Entropy fallback:** off by default. When it's on, a long, high-entropy string
 is redacted only if a keyword (`secret`, `key`, `token`, …) appears just before
@@ -95,7 +117,8 @@ bundled rules:
       "pattern": "\\bctso_[A-Za-z0-9]{32}\\b", // JavaScript regex
       "flags": "i",                          // optional, any of "imsu"
       "keywords": ["ctso_"],                 // optional prefilter (case-insensitive)
-      "secretGroup": 0                       // optional: redact only this capture group
+      "secretGroup": 0,                      // optional: redact only this group ([1, 2] = first that matched)
+      "useAllowlist": true                   // optional: false = redact even SHA/GUID-shaped values
     }
   ],
   "disableRules": ["basic-auth"],            // turn off defaults by id
@@ -103,6 +126,12 @@ bundled rules:
     { "id": "build-ids", "pattern": "build-[0-9]{8}" }
   ],
   "entropy": { "enabled": true },            // partial override of the entropy settings
+  "secretFields": {                          // field-name context in parsed JSON
+    "enabled": true,
+    // matched against the END of the key lowercased with separators removed;
+    // this example adds "connectionstring" to redact whole connection strings
+    "keyPattern": "secret|password|passwd|userpwd|passphrase|apikey|accesskey|accountkey|privatekey|sharedkey|primarykey|secondarykey|masterkey|signingkey|subscriptionkey|clientkey|encryptionkey|token|credentials?|connectionstring"
+  },
   "includeDefaults": true                    // false = use only this file's rules
 }
 ```
@@ -148,8 +177,10 @@ Codex, Cursor, opencode, OMP) passes through that copy, and every later stage
 reads the archive rather than the source. The design and the research behind
 it are in [redaction/PHASE0-FINDINGS.md](redaction/PHASE0-FINDINGS.md).
 
-Each archive line is parsed as JSON, every string value is redacted, and only
-lines that changed are re-serialized. Lines with no secrets stay byte-for-byte
+Each archive line is parsed as JSON. Every string value goes through the text
+rules, values are redacted whole when their field name marks them as secrets
+(`secretFields`), and a key that is itself a secret is renamed to its token.
+Only lines that changed are re-serialized. Lines with no secrets stay byte-for-byte
 identical. The archive keeps exactly one line per source line, so index line
 ranges and MCP `read` ranges still line up. A line that isn't valid JSON (for
 example, a half-written last line) is redacted as plain text.
@@ -159,9 +190,15 @@ example, a half-written last line) is redacted as plain text.
 - Pattern rules miss secrets that have no recognizable shape and no
   `key: value` context. The entropy fallback helps when it's on, but recall
   isn't perfect.
-- Each JSON string value is checked on its own. Context split across fields
-  (`{"name": "DB_PASSWORD", "value": "…"}`) isn't linked, so the `value` is
-  caught only if its own shape matches a rule.
-- JSON object *keys* aren't redacted. Only values are.
+- A secret-looking name is required for the key-context rules. A setting
+  named `Stripe` or `ConnectionStrings__Default` with a shapeless value is
+  only caught if a shape rule matches the value. Connection strings are
+  handled by `connection-string-secret`, which keeps server names searchable.
+  Add your own names via `secretFields.keyPattern` or a custom rule.
+- Quoted values containing spaces (multi-word passphrases) aren't caught by
+  `quoted-secret-assignment`. The rule excludes them so that UI labels like
+  `ErrorMessage = "Invalid password"` aren't redacted.
+- Positional secrets in code (`new ClientSecretCredential(t, c, "…")`) are
+  caught only by shape, e.g. `azure-client-secret`.
 - On lines that get redacted, re-serializing can change number formatting for
   integers above 2^53. No supported harness writes such numbers.
