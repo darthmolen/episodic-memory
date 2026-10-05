@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync } from 'fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, chmodSync, statSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -422,6 +422,16 @@ describe('redaction: copyFileRedacted', () => {
     writeFileSync(src, line + '\n' + line + '\n');
     copyFileRedacted(src, dest, redactor, ctx);
     expect(readFileSync(dest, 'utf-8')).toBe(readFileSync(src, 'utf-8'));
+  });
+
+  // Windows ignores POSIX mode bits.
+  it.skipIf(process.platform === 'win32')('creates dest with the source mode, not the 0666 default', () => {
+    const src = join(dir, 'private.jsonl');
+    const dest = join(dir, 'private-out.jsonl');
+    writeFileSync(src, '{"type":"user"}\n');
+    chmodSync(src, 0o600);
+    copyFileRedacted(src, dest, defaults(), ctx);
+    expect(statSync(dest).mode & 0o777).toBe(0o600);
   });
 });
 

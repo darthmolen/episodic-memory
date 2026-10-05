@@ -723,7 +723,9 @@ export function copyFileRedacted(
   const fdIn = fs.openSync(src, 'r');
   let fdOut: number | undefined;
   try {
-    fdOut = fs.openSync(dest, 'w');
+    // Create with the source's mode, as copyFileSync would, so a 0600
+    // transcript doesn't become world-readable in the archive.
+    fdOut = fs.openSync(dest, 'w', fs.fstatSync(fdIn).mode & 0o777);
     const buf = Buffer.allocUnsafe(COPY_CHUNK_BYTES);
     const decoder = new StringDecoder('utf8');
     let pending = '';
