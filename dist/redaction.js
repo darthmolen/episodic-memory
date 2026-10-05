@@ -310,6 +310,27 @@ function redactAroundTokens(text, spans, start, end, token) {
         flush(end);
     return replaced ? out : null;
 }
+/**
+ * Describe a value without revealing it: length, character classes and
+ * Shannon entropy (bits per char), e.g. "len=40 aA9- H=4.9". Lets someone
+ * reviewing hits tell a random key from a word or a placeholder.
+ */
+export function describeShape(value) {
+    const classes = (/[a-z]/.test(value) ? 'a' : '') +
+        (/[A-Z]/.test(value) ? 'A' : '') +
+        (/[0-9]/.test(value) ? '9' : '') +
+        (/[^A-Za-z0-9\s]/.test(value) ? '-' : '') +
+        (/\s/.test(value) ? '_' : '');
+    return `len=${value.length} ${classes || '?'} H=${shannonEntropy(value).toFixed(1)}`;
+}
+/** Each `[REDACTED:<ruleId>]` token in `text`, left to right. */
+export function findRedactionTokens(text) {
+    const out = [];
+    for (const m of text.matchAll(TOKEN_PATTERN)) {
+        out.push({ ruleId: m[0].slice(TOKEN_PREFIX.length, -1), start: m.index, end: m.index + m[0].length });
+    }
+    return out;
+}
 function shannonEntropy(text) {
     const counts = new Map();
     for (const ch of text)
@@ -327,7 +348,7 @@ function shannonEntropy(text) {
  * redacted (so re-running is a no-op). A candidate is skipped when it fully
  * matches an allowlist pattern.
  */
-function applyRule(text, rule, isAllowed) {
+function applyRule(text, rule, isAllowed, onMatch) {
     const spans = text.includes(TOKEN_PREFIX) ? tokenSpans(text) : null;
     const token = tokenFor(rule.id);
     let out = '';
@@ -351,18 +372,20 @@ function applyRule(text, rule, isAllowed) {
             const rewritten = redactAroundTokens(text, spans, start, end, token);
             if (rewritten === null)
                 continue;
+            onMatch?.(rule.id, text.slice(start, end).replace(TOKEN_PATTERN, ''));
             out += text.slice(last, start) + rewritten;
             last = end;
             count++;
             continue;
         }
+        onMatch?.(rule.id, text.slice(start, end));
         out += text.slice(last, start) + token;
         last = end;
         count++;
     }
     return count === 0 ? { text, count } : { text: out + text.slice(last), count };
 }
-function applyEntropy(text, spec, isAllowed) {
+function applyEntropy(text, spec, isAllowed, onMatch) {
     const candidates = new RegExp(`[A-Za-z0-9+/=_.~-]{${spec.minLength},}`, 'g');
     const spans = text.includes(TOKEN_PREFIX) ? tokenSpans(text) : null;
     const token = tokenFor(ENTROPY_RULE_ID);
@@ -384,6 +407,7 @@ function applyEntropy(text, spec, isAllowed) {
             if (!spec.keywords.some(k => before.includes(k)))
                 continue;
         }
+        onMatch?.(ENTROPY_RULE_ID, m[0]);
         out += text.slice(last, start) + token;
         last = end;
         count++;
@@ -401,7 +425,7 @@ export function createRedactor(config) {
             const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, '').replace(/\d+$/, '');
             return normalized.length > 0 && compiled.secretField.test(normalized);
         },
-        redact(text, _ctx) {
+        redact(text, ctx) {
             if (typeof text !== 'string' || text.length === 0)
                 return { text, findings: [] };
             let current = text;
@@ -413,7 +437,7 @@ export function createRedactor(config) {
                     if (!rule.keywords.some(k => lower.includes(k)))
                         continue;
                 }
-                const r = applyRule(current, rule, isAllowed);
+                const r = applyRule(current, rule, isAllowed, ctx?.onMatch);
                 if (r.count > 0) {
                     current = r.text;
                     lower = null;
@@ -421,7 +445,7 @@ export function createRedactor(config) {
                 }
             }
             if (compiled.entropy.enabled) {
-                const r = applyEntropy(current, compiled.entropy, isAllowed);
+                const r = applyEntropy(current, compiled.entropy, isAllowed, ctx?.onMatch);
                 if (r.count > 0) {
                     current = r.text;
                     counts.set(ENTROPY_RULE_ID, r.count);
@@ -505,8 +529,10 @@ function redactTree(node, redactor, ctx, tally) {
     // MCP result. Runs after the text rules; a value they redacted only in part
     // is still replaced whole, since the field name says all of it is secret.
     const redactWhole = (key) => {
-        if (!isRedactableWhole(obj[key]))
+        const value = obj[key];
+        if (!isRedactableWhole(value))
             return;
+        ctx?.onMatch?.(FIELD_RULE_ID, value);
         setOwn(obj, key, tokenFor(FIELD_RULE_ID));
         tally?.add([{ ruleId: FIELD_RULE_ID, count: 1 }]);
         changed = true;

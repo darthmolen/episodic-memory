@@ -152,9 +152,29 @@ New syncs only redact new or changed files. To redact everything indexed
 before you upgraded, or after you add a rule:
 
 ```bash
-episodic-memory redact --rewrite --dry-run   # report what would change
-episodic-memory redact --rewrite             # apply
+episodic-memory redact --rewrite --dry-run            # report what would change
+episodic-memory redact --rewrite --dry-run --report   # list each hit to review
+episodic-memory redact --rewrite                      # apply
 ```
+
+A dry run writes nothing, not even a schema migration: it opens the index
+read-only.
+
+`--report` lists every value the rewrite would redact, so you can check for
+false positives before applying. Each hit shows where it is, the rule, the
+value's shape, and the redacted text around it. The value itself is never
+printed:
+
+```
+  -work-contoso/4f1c….jsonl:212  quoted-secret-assignment  len=40 aA9- H=4.9
+      …"AzureAd": { "ClientId": "…", "ClientSecret": "[REDACTED:quoted-secret-assignment]", "TenantId…
+```
+
+The shape is the length, the character classes (`a` lowercase, `A` uppercase,
+`9` digits, `-` symbols, `_` whitespace) and the Shannon entropy in bits per
+character. A random key is long with high entropy (about 4.5 or more); a word or
+a placeholder is short or low. If a rule fires on something that isn't a secret,
+turn it off or narrow it in `redaction-rules.json`.
 
 `--rewrite`:
 
