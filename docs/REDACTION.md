@@ -1,224 +1,175 @@
 # Secret redaction
 
 episodic-memory replaces secrets in your conversations with typed tokens
-**before** it archives, indexes, embeds, or summarizes them:
+before it archives, indexes, embeds, or summarizes them:
 
-```
+```text
 AccountKey=<88-char key>          →  AccountKey=[REDACTED:connection-string-secret]
 "ClientSecret": "<any value>"     →  "ClientSecret": "[REDACTED:quoted-secret-assignment]"
 <add key="SmtpPassword" value=…/> →  <add key="SmtpPassword" value="[REDACTED:xml-appsettings-secret]"/>
 Authorization: Bearer <JWT>       →  Authorization: Bearer [REDACTED:jwt]
 ```
 
-Values are redacted, not dropped. The rest of the conversation stays
-searchable, and the token tells you what kind of value was there. You can
-search for the tokens too: `episodic-memory search --text "[REDACTED:azure-storage-key]"`
-finds every conversation where a storage key was pasted.
+Only the value is replaced, so the rest of the conversation stays searchable,
+and the token says what kind of value was there.
+`episodic-memory search --text "[REDACTED:azure-storage-key]"` finds every
+conversation where a storage key was pasted.
 
-Redaction is **on by default**, and it **fails closed**. If the rules can't be
-loaded, sync refuses to run. It won't archive unredacted text.
+Redaction is on by default and fails closed: if the rules can't load, sync
+doesn't run.
 
-## What's covered
+## Where it happens
+
+Every harness's transcripts (Claude Code, Codex, Cursor, opencode, OMP) are
+copied into the conversation archive before anything else reads them. That
+copy is the one point they all pass through, so it is where redaction happens
+([`copyIfNewer`](../src/sync.ts) → [`copyFileRedacted`](../src/redaction.ts)).
+Everything downstream reads the archive:
 
 | Where | Redacted? |
 |---|---|
-| Conversation archive (`~/.config/superpowers/conversation-archive`) | Yes. This is the hook point. |
-| SQLite index: message text and tool inputs/outputs | Yes. Built from the archive. |
-| Embeddings | Yes. Built from redacted text. |
-| Summaries (sent to a model) | Yes. Built from redacted text. Session resume and Codex fork are turned off (see below). |
-| opencode and legacy Cursor staging exports | Yes. Redacted when written. |
-| `show`, MCP `read` | Yes. They read the archive. |
-| Sync logs | Rule IDs and counts only. Matched values are never logged. |
-| Claude Code's own `~/.claude/projects`, Codex's `~/.codex/sessions`, etc. | **No.** Those files belong to the harness. Use its retention settings. |
+| Conversation archive (`~/.config/superpowers/conversation-archive`) | Yes, line by line as it's copied |
+| SQLite index: message text and tool inputs/outputs | Yes, parsed from the archive ([indexer.ts](../src/indexer.ts) included) |
+| Embeddings | Yes, built from redacted text |
+| Summaries (sent to a model) | Yes. Summarizer resume and Codex fork are turned off, because both read the original transcript ([summarizer.ts](../src/summarizer.ts)) |
+| opencode and legacy Cursor staging exports | Yes, when written ([opencode-sync.ts](../src/opencode-sync.ts), [cursor-legacy.ts](../src/cursor-legacy.ts)) |
+| `show`, MCP `read` | Yes, they read the archive |
+| Logs | Rule IDs and counts only |
+| The harness's own files (`~/.claude/projects`, `~/.codex/sessions`, …) | **No.** They belong to the harness; use its retention settings |
 
-### Summaries
+With summarizer resume off, Codex-only setups summarize through the Claude
+Agent SDK. Without Claude configured, set `EPISODIC_MEMORY_SKIP_SUMMARIES=1`.
+Summaries are display-only, so search is unaffected.
 
-Without redaction, the summarizer can *resume* a Claude Code session or *fork*
-a Codex thread. Both make the model read the original, unredacted transcript.
-With redaction on, summaries always come from the redacted conversation text.
-This has one side effect for Codex-only setups: summarization then goes
-through the Claude Agent SDK. If you don't have Claude set up, summaries fail
-and retry on later syncs. Set `EPISODIC_MEMORY_SKIP_SUMMARIES=1` to turn them
-off. Summaries are display-only, so search quality is unaffected.
+## How a secret is recognized
 
-## Default rules
+The engine is [src/redaction.ts](../src/redaction.ts) and the default rules are
+[src/redaction-rules.ts](../src/redaction-rules.ts). Each archive line is parsed
+as JSON and passes through three layers:
 
-Run `episodic-memory redact --print-default-rules` for the full set. In
-summary:
+1. **Shape.** Values whose format gives them away: private keys, JWTs,
+   provider-prefixed keys, Entra client secrets (`…Q~…`), 88-character Azure
+   storage keys, SAS `sig=` values.
+2. **Key context.** Values with no recognizable format, caught by the name
+   they're assigned to: `Password=` in a connection string, `"ClientSecret": "…"`,
+   `<add key="SmtpPassword" value="…"/>`, `{"name": "DB_PASSWORD", "value": "…"}`,
+   `password: …`.
+3. **Field name.** In parsed JSON, any string whose field name is
+   secret-looking is replaced whole, including tool inputs and MCP results.
 
-| Rule ID | Catches |
+A **secret-looking name** *ends* in `secret`, `password`, `passwd`,
+`passphrase`, `apikey`, `accesskey`, `accountkey`, `privatekey`, `token`,
+`credential(s)` or a similar key word, in any case and with any separators
+(`AzureAd:ClientSecret`, `DB_PASSWORD2`). `TokenEndpoint` and `passwordPolicy`
+don't count. Placeholders (`${X}`, `$(X)`, `#{X}#`, `{{x}}`, `<x>`, `%X%`,
+`"string"`, `"*****"`) are left alone.
+
+Git SHAs and GUIDs are allowlisted for the shape rules, so commit hashes and
+tenant, client and object IDs stay searchable. Key-context rules ignore the
+allowlist: a GUID in a `password` slot is a secret. An entropy fallback exists
+but is off by default.
+
+| Rules | Catch |
 |---|---|
-| `private-key-block` | PEM and OpenSSH private keys, including truncated ones |
-| `connection-string-secret` | `AccountKey=`, `SharedAccessKey=`, `SharedAccessSignature=`, `Password=`, `Pwd=` in connection strings, in any case. Only the value is redacted; server, account, and database names stay. |
-| `azure-sas-token` | The `sig=` of a SAS URL. The URL and other parameters stay. |
-| `jwt` | JWTs, including Entra ID / Azure access tokens |
-| `anthropic-api-key`, `openai-api-key`, `github-token`, `aws-access-key-id`, `aws-secret-access-key`, `slack-token`, `google-api-key`, `npm-token` | Provider keys with a recognizable prefix |
-| `azure-client-secret` | Entra ID app client secrets (the `…Q~…` format) |
-| `azure-storage-key` | Standalone 88-character base64 keys (Storage, Cosmos DB, Function keys) |
-| `url-credentials` | The password in `scheme://user:password@host` |
-| `bearer-token`, `basic-auth` | `Authorization` header values |
-| `azure-keyvault-secret` | The `value` of a Key Vault secret bundle (`az keyvault secret show`, SDK JSON), whatever the secret is named |
-| `name-value-secret` | The `value` of a `{"name": <secret-looking name>, "value": …}` object, in either order: `az webapp`/`functionapp config appsettings list`, Kubernetes `env`, ARM/Bicep parameters |
-| `xml-appsettings-secret` | `web.config` / `app.config` `<add key="<secret-looking name>" value="…"/>`, either attribute order |
-| `xml-secret-element` | `<ClientSecret>…</ClientSecret>`, `<Password>…</Password>` and the like |
-| `xml-secret-attribute` | Secret-named XML attributes, e.g. `userPWD="…"` in Azure publish profiles |
-| `quoted-secret-assignment` | A **quoted** value assigned to a secret-looking name: `"ClientSecret": "…"` (appsettings.json and any JSON in tool output), `ClientSecret = "…"` (C#), `apiKey: '…'` (JS/YAML/Python). No digit or minimum entropy is required; the value must have no spaces. |
-| `secret-assignment` | An **unquoted** value assigned to a secret-looking key: `password: …`, `CLIENT_SECRET=…`. Covers decrypted SOPS, YAML, and dotenv. Needs 8+ characters including a digit, and skips code (`env.X`, `getPassword()`). |
-| `secret-field` | Not a text rule: in parsed JSON (transcript lines, structured MCP/tool results, tool inputs), a string whose **field name** is secret-looking, or the `value` of a `{name, value}` pair or Key Vault bundle, is redacted whole. See `secretFields` below. |
+| `private-key-block`, `jwt`, `anthropic-api-key`, `openai-api-key`, `github-token`, `aws-access-key-id`, `aws-secret-access-key`, `slack-token`, `google-api-key`, `npm-token`, `azure-client-secret`, `azure-storage-key`, `azure-sas-token` | Shape |
+| `connection-string-secret` | `AccountKey=`, `SharedAccessKey=`, `Password=`, `Pwd=` and similar in connection strings, any case |
+| `url-credentials`, `bearer-token`, `basic-auth` | `scheme://user:password@host`, `Authorization` headers |
+| `azure-keyvault-secret`, `name-value-secret` | Key Vault bundles; `{name, value}` pairs (`az … appsettings list`, Kubernetes `env`, ARM parameters) |
+| `xml-appsettings-secret`, `xml-secret-element`, `xml-secret-attribute` | `web.config`, `<Password>…</Password>`, publish-profile `userPWD="…"` |
+| `quoted-secret-assignment` | `"ClientSecret": "…"`, `ClientSecret = "…"`, `apiKey: '…'`; no spaces in the value |
+| `secret-assignment` | `password: …`, `CLIENT_SECRET=…` (YAML, dotenv, decrypted SOPS); 8+ characters with a digit, code like `env.X` skipped |
+| `secret-field` | Layer 3: a secret-named JSON field, replaced whole |
 
-A **secret-looking name** ends in `secret`, `password`, `passwd`,
-`passphrase`, `apikey`, `accesskey`, `accountkey`, `privatekey`, `sharedkey`,
-`primarykey`, `secondarykey`, `masterkey`, `signingkey`, `subscriptionkey`,
-`clientkey`, `encryptionkey`, `token`, or `credential(s)`, in any case and
-with any separators (`AzureAd:ClientSecret`, `Stripe__ApiKey`, `DB_PASSWORD2`).
-Because it has to *end* in one of these, `TokenEndpoint`, `secretName`,
-`passwordPolicy`, `tokenType`, and `maxTokens` don't count.
+`episodic-memory redact --print-default-rules` prints the full definitions.
 
-Key-context rules leave **placeholders** alone: `${X}`, `$(X)`, `#{X}#`
-(Azure DevOps token replacement), `{{x}}`, `<x>`, `%X%`, `__X__`, and type
-names or masks like `"string"` and `"*****"`. All other rules skip the same
-`${X}`, `<x>`, and `%X%` forms.
+## Guarantees
 
-**Allowlisted:** git SHAs and GUIDs are not redacted by shape-based rules,
-so tenant, client, object, and subscription IDs and commit hashes stay
-searchable. Key-context rules ignore the allowlist on purpose: a GUID in a
-`password` slot (older `az ad sp create-for-rbac` output) *is* a secret.
+- **Fails closed.** In strict mode (the default), sync, index, `index repair`
+  and import stop if the rules can't load.
+- **Idempotent.** Tokens never match again. When a match runs into an existing
+  token, only the text outside it is redacted, so re-running after adding a
+  rule is safe.
+- **Structure-preserving.** One output line per input line, valid JSON stays
+  valid, and lines with no secrets stay byte-for-byte identical. Index line
+  ranges and MCP `read` ranges stay correct. Archive copies keep the source
+  file's permissions.
+- **Values are never printed.** Logs and reports name rules and counts; the
+  review report adds the value's shape, never the value.
 
-**Entropy fallback:** off by default. When it's on, a long, high-entropy string
-is redacted only if a keyword (`secret`, `key`, `token`, …) appears just before
-it in the same text value.
+## Cleaning up existing data
 
-**SOPS:** decrypted SOPS output drops its `sops:` metadata block, so it has no
-reliable shape. It's covered by the value rules plus `secret-assignment`.
-Encrypted values (`ENC[AES256_GCM,…]`) are left alone.
+New syncs redact what they copy. To redact what was archived and indexed
+before, or after you add a rule:
+
+```bash
+episodic-memory redact --rewrite --dry-run            # what would change; writes nothing
+episodic-memory redact --rewrite --dry-run --report   # each hit, to check for false positives
+episodic-memory redact --rewrite                      # apply
+```
+
+`--rewrite` ([src/redact-rewrite.ts](../src/redact-rewrite.ts)) redacts the
+archive, the staging exports and the index in place, re-embeds only the rows
+that changed, and deletes summaries built from unredacted text so the next
+sync regenerates them. It takes the sync lock. A dry run opens the index
+read-only.
+
+`--report` prints one hit per value:
+
+```text
+  -work-contoso/4f1c….jsonl:212  quoted-secret-assignment  len=40 aA9- H=4.9
+      …"AzureAd": { "ClientId": "…", "ClientSecret": "[REDACTED:quoted-secret-assignment]", "TenantId…
+```
+
+The shape is the length, the character classes (`a` lower, `A` upper, `9`
+digits, `-` symbols, `_` spaces) and the entropy in bits per character. A
+random key is long with entropy around 4.5 or more; a word or placeholder is
+short or low.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `EPISODIC_MEMORY_REDACTION` | `on` | `off` disables redaction entirely: archive copies become byte-for-byte again, and summaries may resume sessions again. |
-| `EPISODIC_MEMORY_REDACTION_RULES` | `<config dir>/redaction-rules.json` if it exists | Path to a custom rules file. If you set this and the file is missing, that's an error. |
-| `EPISODIC_MEMORY_REDACTION_STRICT` | `1` | When the rules fail to load, `1` stops sync, index, and import (exit 1, nothing written). `0` logs a loud warning and continues **unredacted**. |
+| `EPISODIC_MEMORY_REDACTION` | `on` | `off` turns redaction off: byte-for-byte archive copies, summarizer resume allowed |
+| `EPISODIC_MEMORY_REDACTION_RULES` | `<config dir>/redaction-rules.json` if present | Custom rules file; a missing file you named is an error |
+| `EPISODIC_MEMORY_REDACTION_STRICT` | `1` | `0` continues **unredacted**, with a warning, when the rules fail to load |
 
-`<config dir>` is `~/.config/superpowers` unless `EPISODIC_MEMORY_CONFIG_DIR`,
-`PERSONAL_SUPERPOWERS_DIR`, or `XDG_CONFIG_HOME` say otherwise.
-
-### Custom rules
-
-Create `~/.config/superpowers/redaction-rules.json`. By default it extends the
-bundled rules:
+Custom rules extend the defaults:
 
 ```jsonc
 {
-  // Add rules (a rule with a default's id replaces that default)
-  "rules": [
-    {
-      "id": "contoso-api-key",              // lowercase, digits, dashes
-      "pattern": "\\bctso_[A-Za-z0-9]{32}\\b", // JavaScript regex
-      "flags": "i",                          // optional, any of "imsu"
-      "keywords": ["ctso_"],                 // optional prefilter (case-insensitive)
-      "secretGroup": 0,                      // optional: redact only this group ([1, 2] = first that matched)
-      "useAllowlist": true                   // optional: false = redact even SHA/GUID-shaped values
-    }
+  "rules": [                                 // a rule with a default's id replaces it
+    { "id": "contoso-api-key", "pattern": "\\bctso_[A-Za-z0-9]{32}\\b", "keywords": ["ctso_"] }
   ],
-  "disableRules": ["basic-auth"],            // turn off defaults by id
-  "allowlist": [                             // full-match patterns that are never redacted
-    { "id": "build-ids", "pattern": "build-[0-9]{8}" }
-  ],
-  "entropy": { "enabled": true },            // partial override of the entropy settings
-  "secretFields": {                          // field-name context in parsed JSON
-    "enabled": true,
-    // matched against the END of the key lowercased with separators removed;
-    // this example adds "connectionstring" to redact whole connection strings
-    "keyPattern": "secret|password|passwd|userpwd|passphrase|apikey|accesskey|accountkey|privatekey|sharedkey|primarykey|secondarykey|masterkey|signingkey|subscriptionkey|clientkey|encryptionkey|token|credentials?|connectionstring"
-  },
-  "includeDefaults": true                    // false = use only this file's rules
+  "disableRules": ["basic-auth"],
+  "allowlist": [{ "id": "build-ids", "pattern": "build-[0-9]{8}" }],
+  "entropy": { "enabled": true },
+  "secretFields": { "keyPattern": "secret|password|token|credentials?|connectionstring" },
+  "includeDefaults": true
 }
 ```
 
-Every rule is validated when it loads. An invalid regex, a bad id, a pattern
-that matches the empty string, or a `secretGroup` that doesn't exist is a
-rules-load failure, which strict mode treats as fatal. To try rules out:
+A rule can also set `flags` (`imsu`), `secretGroup` (redact only that capture
+group) and `useAllowlist: false`. Every rule is validated on load; an invalid
+one is a load failure, which strict mode treats as fatal. Try rules with
+`echo 'password: hunter2hunter2' | episodic-memory redact --stdin`.
 
-```bash
-echo 'password: hunter2hunter2' | episodic-memory redact --stdin
-# password: [REDACTED:secret-assignment]
-# 1 value(s) redacted (secret-assignment: 1)      (stderr)
-```
+## Limits
 
-## Cleaning up existing data
+This is pattern and context matching, not named-entity recognition: a value
+is caught by its format, by the name it's assigned to, or by the field it's
+in. That covers how secrets reach transcripts in practice (pasted config, CLI
+output, connection strings, tool results), and it is deterministic, cheap
+enough for every line of every sync, and each token names the rule that fired.
+What it misses:
 
-New syncs only redact new or changed files. To redact everything indexed
-before you upgraded, or after you add a rule:
+- A secret in prose with no name or shape: "the password is hunter2".
+- An unquoted letters-only value (`password: hunter`): `secret-assignment`
+  needs a digit so ordinary English doesn't trigger it.
+- Code-like values (`config.password`, `getPassword()`), skipped on purpose.
+- Quoted values with spaces, so UI strings like `"Invalid password"` survive.
+- Settings with a shapeless value and a name that isn't secret-looking
+  (`Stripe`, `ConnectionStrings__Default`). Add the name to
+  `secretFields.keyPattern` or write a rule.
 
-```bash
-episodic-memory redact --rewrite --dry-run            # report what would change
-episodic-memory redact --rewrite --dry-run --report   # list each hit to review
-episodic-memory redact --rewrite                      # apply
-```
-
-A dry run writes nothing, not even a schema migration: it opens the index
-read-only.
-
-`--report` lists every value the rewrite would redact, so you can check for
-false positives before applying. Each hit shows where it is, the rule, the
-value's shape, and the redacted text around it. The value itself is never
-printed:
-
-```
-  -work-contoso/4f1c….jsonl:212  quoted-secret-assignment  len=40 aA9- H=4.9
-      …"AzureAd": { "ClientId": "…", "ClientSecret": "[REDACTED:quoted-secret-assignment]", "TenantId…
-```
-
-The shape is the length, the character classes (`a` lowercase, `A` uppercase,
-`9` digits, `-` symbols, `_` whitespace) and the Shannon entropy in bits per
-character. A random key is long with high entropy (about 4.5 or more); a word or
-a placeholder is short or low. If a rule fires on something that isn't a secret,
-turn it off or narrow it in `redaction-rules.json`.
-
-`--rewrite`:
-
-- redacts every archive file in place, keeping line numbers and timestamps
-- redacts the opencode and Cursor staging exports in place
-- redacts every index row in place and re-embeds only the rows that changed
-- deletes summaries that were generated from unredacted text, so the next
-  sync regenerates them from the redacted archive
-
-It takes the same lock as `sync`, so it won't run while a sync is in progress.
-Running it twice is safe: the second run finds nothing to change.
-
-Before your first sync with this version, consider a one-time scan of your
-existing `~/.claude/projects` history. Those source files are never modified.
-
-## How it works
-
-The hook point is the copy into the archive. Every harness (Claude Code,
-Codex, Cursor, opencode, OMP) passes through that copy, and every later stage
-reads the archive rather than the source. The design and the research behind
-it are in [redaction/PHASE0-FINDINGS.md](redaction/PHASE0-FINDINGS.md).
-
-Each archive line is parsed as JSON. Every string value goes through the text
-rules, values are redacted whole when their field name marks them as secrets
-(`secretFields`), and a key that is itself a secret is renamed to its token.
-Only lines that changed are re-serialized. Lines with no secrets stay byte-for-byte
-identical. The archive keeps exactly one line per source line, so index line
-ranges and MCP `read` ranges still line up. A line that isn't valid JSON (for
-example, a half-written last line) is redacted as plain text.
-
-## Limitations
-
-- Pattern rules miss secrets that have no recognizable shape and no
-  `key: value` context. The entropy fallback helps when it's on, but recall
-  isn't perfect.
-- A secret-looking name is required for the key-context rules. A setting
-  named `Stripe` or `ConnectionStrings__Default` with a shapeless value is
-  only caught if a shape rule matches the value. Connection strings are
-  handled by `connection-string-secret`, which keeps server names searchable.
-  Add your own names via `secretFields.keyPattern` or a custom rule.
-- Quoted values containing spaces (multi-word passphrases) aren't caught by
-  `quoted-secret-assignment`. The rule excludes them so that UI labels like
-  `ErrorMessage = "Invalid password"` aren't redacted.
-- Positional secrets in code (`new ClientSecretCredential(t, c, "…")`) are
-  caught only by shape, e.g. `azure-client-secret`.
-- On lines that get redacted, re-serializing can change number formatting for
-  integers above 2^53. No supported harness writes such numbers.
+The entropy fallback narrows some of these gaps, at the cost of false
+positives.

@@ -177,7 +177,7 @@ export interface SummarizeOptions {
      * Allow Claude session resume and Codex thread/fork (default true). Both
      * paths make the model read the *source* transcript rather than `exchanges`,
      * so callers pass false when the exchanges were redacted (see
-     * docs/redaction/PHASE0-FINDINGS.md) to force the transcript-text path.
+     * docs/REDACTION.md) to force the transcript-text path.
      */
     allowResume?: boolean;
 }

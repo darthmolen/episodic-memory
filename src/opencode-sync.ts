@@ -176,7 +176,7 @@ function writeSessionTranscript(
   }
 
   // The staging transcript is a plugin-owned plaintext copy, so redact it at
-  // write time like the archive (docs/redaction/PHASE0-FINDINGS.md).
+  // write time like the archive (docs/REDACTION.md).
   const output = redactor
     ? lines.map(line => redactJsonlLine(line, redactor, { source: 'opencode', path: filePath }))
     : lines;

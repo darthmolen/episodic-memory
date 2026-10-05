@@ -206,7 +206,7 @@ export function importCursorLegacy(options) {
                         ? lines.map(line => JSON.stringify({ ...JSON.parse(line), cwd }))
                         : lines;
                     // The export dir is a plugin-owned plaintext copy, so redact it at
-                    // write time like the archive (docs/redaction/PHASE0-FINDINGS.md).
+                    // write time like the archive (docs/REDACTION.md).
                     const finalLines = redactor
                         ? withCwd.map(line => redactJsonlLine(line, redactor, { source: 'cursor-legacy', path: outFile }))
                         : withCwd;

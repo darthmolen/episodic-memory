@@ -8,7 +8,7 @@ import { DEFAULT_REDACTION_CONFIG } from './redaction-rules.js';
  *
  * Secrets are replaced with typed tokens (`[REDACTED:<ruleId>]`) at the archive
  * write, the one point every harness's transcripts pass through (see
- * docs/redaction/PHASE0-FINDINGS.md). Everything downstream (SQLite text,
+ * docs/REDACTION.md). Everything downstream (SQLite text,
  * tool_calls, embeddings, summaries, show/read) reads the archive, so it only
  * ever sees redacted text.
  *
