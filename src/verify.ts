@@ -162,6 +162,9 @@ export async function repairIndex(issues: VerificationResult): Promise<void> {
       // Generate/update summary
       const summaryPath = conversationPath.replace('.jsonl', '-summary.txt');
       // Under redaction, don't let the Codex fork fallback read the source rollout.
+      // This keys off the setting, not the loaded redactor as indexer.ts does, which
+      // is stricter: they differ only when non-strict rules fail to load, and then
+      // this disables a resume the indexer would allow. It never enables one.
       const summary = await summarizeConversation(exchanges, undefined, { allowResume: !getRedactionSettings().enabled });
       fs.writeFileSync(summaryPath, summary, 'utf-8');
       console.log(`  Created summary: ${summary.split(/\s+/).length} words`);
