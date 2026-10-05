@@ -278,6 +278,10 @@ describe('redaction: allowlist and false-positive resistance (negative)', () => 
     expectUntouched('PWD=/home/user1/src/project2\nOLDPWD=/home/user1\nmax_tokens: 4096\ntokenizer: bert-base-uncased');
   });
 
+  it('Markdown about connection-string keywords survives', () => {
+    expectUntouched('Set `AccountKey=`, `SharedAccessKey=`, `Password=` or `Pwd=` in the connection string.');
+  });
+
   it('prose about tokens and passwords survives', () => {
     expectUntouched('Rotate the bearer token every 90 days. Basic authentication is disabled. The password policy requires 14 characters.');
   });
