@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readdirSync, statSync,
+  appendFileSync, utimesSync,
 } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -343,6 +344,36 @@ describe('redaction pipeline', () => {
     expect(summarizeSpy).toHaveBeenCalledTimes(1);
     expectNoSecrets(JSON.stringify(summarizeSpy.mock.calls), s, 'summarizer input (index path)');
     expect(summarizeSpy.mock.calls[0][2]).toMatchObject({ allowResume: false });
+  });
+
+  it('the `index` path refreshes an indexed archive even when the append left the source mtime no newer', async () => {
+    const fake = new FakeSecrets(78);
+    const secret = fake.azureClientSecret();
+    const base = { sessionId: SESSION, isSidechain: false, cwd: '/work/contoso', gitBranch: 'main', version: '2.0.0' };
+    const exchange = (n: number, text: string) => [
+      { ...base, type: 'user', uuid: `u${n}`, parentUuid: n > 1 ? `a${n - 1}` : null,
+        timestamp: new Date(Date.UTC(2026, 0, 1, 0, n)).toISOString(),
+        message: { role: 'user', content: text } },
+      { ...base, type: 'assistant', uuid: `a${n}`, parentUuid: `u${n}`,
+        timestamp: new Date(Date.UTC(2026, 0, 1, 0, n, 30)).toISOString(),
+        message: { role: 'assistant', content: [{ type: 'text', text: `Reply ${n}.` }] } },
+    ].map(l => JSON.stringify(l) + '\n').join('');
+    const src = join(sourceDir, '-work-contoso', `${SESSION}.jsonl`);
+
+    writeFileSync(src, exchange(1, 'First question.'));
+    await indexUnprocessed(1, true);
+    const archived = walkFiles(archiveDir).filter(f => f.endsWith('.jsonl'))[0];
+    const archivedMtime = statSync(archived).mtime;
+
+    // Append, then pin the source mtime to the archive's: copyIfNewer's mtime
+    // check alone would treat the archive as current.
+    appendFileSync(src, exchange(2, `Second question with ${secret} as the secret`));
+    utimesSync(src, archivedMtime, archivedMtime);
+    await indexUnprocessed(1, true);
+
+    const text = dbText(dbPath);
+    expect(text).toContain('Second question with [REDACTED:');
+    expect(text).not.toContain(secret);
   });
 });
 

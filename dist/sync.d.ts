@@ -52,7 +52,11 @@ export declare function buildSyncOptionsFromEnv(env: NodeJS.ProcessEnv): SyncOpt
  * older. This is the redaction choke point: with a redactor, the copy is
  * redacted line by line (see redaction.ts), and every downstream stage
  * (index, embeddings, summaries, show/read) reads the archive.
+ *
+ * `force` copies even when the mtimes say the archive is current: an append
+ * within the mtime granularity (or the millisecond the rounding below adds)
+ * leaves the source no newer than the archive.
  */
-export declare function copyIfNewer(src: string, dest: string, redactor?: Redactor | null, tally?: FindingsTally): boolean;
+export declare function copyIfNewer(src: string, dest: string, redactor?: Redactor | null, tally?: FindingsTally, force?: boolean): boolean;
 export declare function extractSessionIdFromPath(filePath: string): string | null;
 export declare function syncConversations(sourceDir: string, destDir: string, options?: SyncOptions): Promise<SyncResult>;

@@ -381,9 +381,10 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
       const maxIndexedLine = hw.maxLine;
 
       try {
-        // Refresh the (redacted) archive when the source has grown, then parse
-        // the archive so the index only sees redacted text.
-        copyIfNewer(sourcePath, archivePath, redactor, tally);
+        // Refresh the (redacted) archive, then parse the archive so the index
+        // only sees redacted text. Force the refresh once the file is indexed:
+        // an append inside the mtime granularity would otherwise be skipped.
+        copyIfNewer(sourcePath, archivePath, redactor, tally, maxIndexedLine > 0);
 
         // Parse and filter to exchanges past the high-water mark
         const exchanges = await parseConversation(archivePath, project, archivePath);

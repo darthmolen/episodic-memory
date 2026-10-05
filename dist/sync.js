@@ -128,15 +128,19 @@ export function buildSyncOptionsFromEnv(env) {
  * older. This is the redaction choke point: with a redactor, the copy is
  * redacted line by line (see redaction.ts), and every downstream stage
  * (index, embeddings, summaries, show/read) reads the archive.
+ *
+ * `force` copies even when the mtimes say the archive is current: an append
+ * within the mtime granularity (or the millisecond the rounding below adds)
+ * leaves the source no newer than the archive.
  */
-export function copyIfNewer(src, dest, redactor = null, tally) {
+export function copyIfNewer(src, dest, redactor = null, tally, force = false) {
     // Ensure destination directory exists
     const destDir = path.dirname(dest);
     if (!fs.existsSync(destDir)) {
         fs.mkdirSync(destDir, { recursive: true });
     }
     // Check if destination exists and is up-to-date
-    if (fs.existsSync(dest)) {
+    if (!force && fs.existsSync(dest)) {
         const srcStat = fs.statSync(src);
         const destStat = fs.statSync(dest);
         if (destStat.mtimeMs >= srcStat.mtimeMs) {
