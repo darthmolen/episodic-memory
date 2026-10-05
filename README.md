@@ -331,6 +331,7 @@ episodic-memory sync
 
 ```bash
 episodic-memory redact --rewrite --dry-run   # what would change
+episodic-memory redact --rewrite --dry-run --report   # each hit: location, rule, value shape
 episodic-memory redact --rewrite             # redact the existing archive + index in place
 episodic-memory redact --stdin < file.jsonl  # try the rules on some text
 episodic-memory redact --print-default-rules

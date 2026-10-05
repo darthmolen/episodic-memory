@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, utimesSync } from 'fs';
-import { join } from 'path';
+import { join, sep } from 'path';
 import { tmpdir } from 'os';
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
@@ -163,6 +163,94 @@ describe('redact --rewrite backfill', () => {
     expect(existsSync(dirty.replace('.jsonl', '-summary.txt'))).toBe(true);
     expect(dbDump()).toContain(secret);
     expect(embed).not.toHaveBeenCalled();
+  });
+
+  it('--dry-run leaves an older-schema index byte-identical instead of migrating it', async () => {
+    await seedLegacy(new FakeSecrets(910));
+    const legacy = new Database(dbPath);
+    legacy.exec('ALTER TABLE exchanges DROP COLUMN embedding_version');
+    legacy.close();
+    const before = readFileSync(dbPath);
+
+    const result = await rewriteArchive({ archiveDir, redactor: createRedactor(DEFAULT_REDACTION_CONFIG), embed, dryRun: true });
+
+    expect(result.rowsUpdated).toBeGreaterThan(0);
+    expect(readFileSync(dbPath).equals(before)).toBe(true);
+    const db = new Database(dbPath, { readonly: true });
+    const columns = (db.prepare('PRAGMA table_info(exchanges)').all() as Array<{ name: string }>).map(c => c.name);
+    db.close();
+    expect(columns).not.toContain('embedding_version');
+  });
+
+  it('--dry-run does not create an index that does not exist', async () => {
+    mkdirSync(join(archiveDir, '-work-legacy'), { recursive: true });
+    const result = await rewriteArchive({ archiveDir, redactor: createRedactor(DEFAULT_REDACTION_CONFIG), embed, dryRun: true });
+    expect(result.rowsUpdated).toBe(0);
+    expect(existsSync(dbPath)).toBe(false);
+  });
+
+  it('report lists one hit per redacted value, with location, rule and shape but never the value', async () => {
+    const { secret, password } = await seedLegacy(new FakeSecrets(911));
+    const hits: Array<{ location: string; ruleId: string; shape: string; context: string }> = [];
+
+    const result = await rewriteArchive({
+      archiveDir, redactor: createRedactor(DEFAULT_REDACTION_CONFIG), embed, dryRun: true, report: hit => hits.push(hit),
+    });
+
+    const total = result.findings.reduce((n, f) => n + f.count, 0);
+    expect(hits.length).toBe(total);
+    const text = JSON.stringify(hits);
+    expect(text).not.toContain(secret);
+    expect(text).not.toContain(password);
+
+    const archiveHit = hits.find(h => h.location === `-work-legacy${sep}${SESSION}.jsonl:1`);
+    expect(archiveHit?.ruleId).toBe('connection-string-secret');
+    expect(archiveHit!.shape).toMatch(new RegExp(`^len=${secret.length} \\S+ H=\\d+\\.\\d$`));
+    expect(archiveHit!.context).toContain('AccountKey=[REDACTED:connection-string-secret]');
+    expect(hits.some(h => h.location.startsWith('index:') && h.location.includes(' user'))).toBe(true);
+  });
+
+  it('report refuses to run without dryRun, since files would already be rewritten', async () => {
+    mkdirSync(archiveDir, { recursive: true });
+    await expect(rewriteArchive({
+      archiveDir, redactor: createRedactor(DEFAULT_REDACTION_CONFIG), embed, report: () => {},
+    })).rejects.toThrow(/dryRun/);
+  });
+
+  /** Dry-run report over one archive file holding `line`. */
+  async function reportLine(line: string) {
+    mkdirSync(join(archiveDir, '-work-x'), { recursive: true });
+    writeFileSync(join(archiveDir, '-work-x', 's.jsonl'), line + '\n');
+    const hits: Array<{ location: string; ruleId: string; shape: string; context: string }> = [];
+    await rewriteArchive({ archiveDir, redactor: createRedactor(DEFAULT_REDACTION_CONFIG), embed, dryRun: true, report: h => hits.push(h) });
+    return hits;
+  }
+
+  it('report pairs a new hit with its own token, not an earlier token of the same rule', async () => {
+    const pw = new FakeSecrets(912).chars('abcdefghijklmnopqrstuvwxyz', 14);
+    const hits = await reportLine(
+      JSON.stringify({ content: `first: Server=a;password=${pw}; later: Server=b;Password=[REDACTED:connection-string-secret];` })
+    );
+    expect(hits).toHaveLength(1);
+    expect(hits[0].shape).toMatch(/^len=14 a /);
+    expect(hits[0].context).toContain('first: Server=a;password=[REDACTED:connection-string-secret]');
+    expect(hits[0].context).not.toContain('--hit');
+  });
+
+  it('report keeps a hit swallowed by a whole secret field, and shapes the field from its original value', async () => {
+    const fake = new FakeSecrets(913);
+    const word = fake.chars('abcdefghijklmnopqrstuvwxyz', 9);
+    const jwt = fake.jwt();
+    const hits = await reportLine(JSON.stringify({ password: `${word} ${jwt}` }));
+
+    expect(hits.map(h => h.ruleId).sort()).toEqual(['jwt', 'secret-field']);
+    const field = hits.find(h => h.ruleId === 'secret-field')!;
+    expect(field.shape).toMatch(new RegExp(`^len=${word.length + 1 + jwt.length} `));
+    const swallowed = hits.find(h => h.ruleId === 'jwt')!;
+    expect(swallowed.shape).toMatch(new RegExp(`^len=${jwt.length} `));
+    expect(swallowed.context).toBe(field.context);
+    expect(field.context).toContain('"password":"[REDACTED:secret-field]"');
+    expect(JSON.stringify(hits)).not.toContain(word);
   });
 });
 
