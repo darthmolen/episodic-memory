@@ -4,7 +4,7 @@ import { parseConversation } from './parser.js';
 import { initDatabase, getAllExchanges, getFileLastIndexed } from './db.js';
 import { getArchiveDir, getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
 import { isErroredSentinel } from './summary-sentinel.js';
-import { getRedactionSettings } from './redaction.js';
+import { loadRedactor } from './redaction.js';
 
 export interface VerificationResult {
   missing: Array<{ path: string; reason: string }>;
@@ -122,6 +122,10 @@ export async function verifyIndex(): Promise<VerificationResult> {
 export async function repairIndex(issues: VerificationResult): Promise<void> {
   console.log('Repairing index...');
 
+  // Load before touching the index: strict mode fails closed here, as in sync
+  // and index.
+  const redactor = loadRedactor();
+
   // To avoid circular dependencies, we import the indexer functions dynamically
   const { initDatabase, insertExchange, deleteExchange } = await import('./db.js');
   const { parseConversation } = await import('./parser.js');
@@ -162,10 +166,7 @@ export async function repairIndex(issues: VerificationResult): Promise<void> {
       // Generate/update summary
       const summaryPath = conversationPath.replace('.jsonl', '-summary.txt');
       // Under redaction, don't let the Codex fork fallback read the source rollout.
-      // This keys off the setting, not the loaded redactor as indexer.ts does, which
-      // is stricter: they differ only when non-strict rules fail to load, and then
-      // this disables a resume the indexer would allow. It never enables one.
-      const summary = await summarizeConversation(exchanges, undefined, { allowResume: !getRedactionSettings().enabled });
+      const summary = await summarizeConversation(exchanges, undefined, { allowResume: redactor === null });
       fs.writeFileSync(summaryPath, summary, 'utf-8');
       console.log(`  Created summary: ${summary.split(/\s+/).length} words`);
 
