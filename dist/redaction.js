@@ -502,8 +502,8 @@ function redactTree(node, redactor, ctx, tally) {
     // Field-name context: the key (or a {name, value} pair's name, or a Key
     // Vault secret id) says the value is a secret even when its shape matches
     // no rule — e.g. a letters-only clientSecret field in a structured
-    // MCP result. Runs after the text rules, so a value they already redacted
-    // in part (a connection string) keeps its searchable remainder.
+    // MCP result. Runs after the text rules; a value they redacted only in part
+    // is still replaced whole, since the field name says all of it is secret.
     const redactWhole = (key) => {
         if (!isRedactableWhole(obj[key]))
             return;
@@ -553,10 +553,13 @@ function setOwn(obj, key, value) {
     // defineProperty so a "__proto__" key from JSON.parse stays an own property.
     Object.defineProperty(obj, key, { value, writable: true, enumerable: true, configurable: true });
 }
+// A value that is only tokens is already redacted; anything else in a secret
+// field, even alongside a token, is replaced whole.
+const ONLY_TOKENS = /^\s*(?:\[REDACTED:[a-z0-9][a-z0-9-]*\]\s*)+$/;
 function isRedactableWhole(value) {
     return typeof value === 'string' &&
         value.trim().length > 0 &&
-        !value.includes(TOKEN_PREFIX) &&
+        !ONLY_TOKENS.test(value) &&
         !PLACEHOLDER_VALUE.test(value.trim());
 }
 /**
