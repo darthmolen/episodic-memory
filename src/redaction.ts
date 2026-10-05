@@ -122,8 +122,10 @@ export interface RedactionContext {
   /**
    * Called with each value as it is redacted. For local review tooling
    * (`redact --report`) only: the value is the secret itself, so never log it.
+   * May return the token to write instead of `[REDACTED:<ruleId>]`, e.g. one
+   * numbered per hit; it must still have the token's shape.
    */
-  onMatch?: (ruleId: string, value: string) => void;
+  onMatch?: (ruleId: string, value: string) => string | void;
 }
 
 export interface RedactionFinding {
@@ -425,6 +427,14 @@ function tokenFor(ruleId: string): string {
   return `${TOKEN_PREFIX}${ruleId}]`;
 }
 
+const WHOLE_TOKEN = /^\[REDACTED:[a-z0-9][a-z0-9-]*\]$/;
+
+/** The token for one redacted value: onMatch's, if it returns a valid one. */
+function tokenForMatch(ruleId: string, value: string, onMatch: RedactionContext['onMatch']): string {
+  const custom = onMatch?.(ruleId, value);
+  return typeof custom === 'string' && WHOLE_TOKEN.test(custom) ? custom : tokenFor(ruleId);
+}
+
 function tokenSpans(text: string): Array<[number, number]> {
   const spans: Array<[number, number]> = [];
   for (const m of text.matchAll(TOKEN_PATTERN)) spans.push([m.index!, m.index! + m[0].length]);
@@ -446,7 +456,7 @@ function redactAroundTokens(
   spans: Array<[number, number]>,
   start: number,
   end: number,
-  token: string
+  token: () => string
 ): string | null {
   let out = '';
   let pos = start;
@@ -454,7 +464,7 @@ function redactAroundTokens(
   const flush = (to: number) => {
     const piece = text.slice(pos, to);
     if (/[A-Za-z0-9]/.test(piece)) {
-      out += token;
+      out += token();
       replaced = true;
     } else {
       out += piece;
@@ -518,7 +528,6 @@ function applyRule(
   onMatch?: RedactionContext['onMatch']
 ): { text: string; count: number } {
   const spans = text.includes(TOKEN_PREFIX) ? tokenSpans(text) : null;
-  const token = tokenFor(rule.id);
   let out = '';
   let last = 0;
   let count = 0;
@@ -533,16 +542,16 @@ function applyRule(
     if (end <= start || start < last) continue;
     if (rule.useAllowlist && isAllowed(text.slice(start, end))) continue;
     if (spans && overlapsAny(spans, start, end)) {
-      const rewritten = redactAroundTokens(text, spans, start, end, token);
+      let token: string | undefined;
+      const rewritten = redactAroundTokens(text, spans, start, end, () =>
+        (token ??= tokenForMatch(rule.id, text.slice(start, end).replace(TOKEN_PATTERN, ''), onMatch)));
       if (rewritten === null) continue;
-      onMatch?.(rule.id, text.slice(start, end).replace(TOKEN_PATTERN, ''));
       out += text.slice(last, start) + rewritten;
       last = end;
       count++;
       continue;
     }
-    onMatch?.(rule.id, text.slice(start, end));
-    out += text.slice(last, start) + token;
+    out += text.slice(last, start) + tokenForMatch(rule.id, text.slice(start, end), onMatch);
     last = end;
     count++;
   }
@@ -557,7 +566,6 @@ function applyEntropy(
 ): { text: string; count: number } {
   const candidates = new RegExp(`[A-Za-z0-9+/=_.~-]{${spec.minLength},}`, 'g');
   const spans = text.includes(TOKEN_PREFIX) ? tokenSpans(text) : null;
-  const token = tokenFor(ENTROPY_RULE_ID);
   let out = '';
   let last = 0;
   let count = 0;
@@ -572,8 +580,7 @@ function applyEntropy(
       before = before.slice(before.lastIndexOf('\n') + 1).toLowerCase();
       if (!spec.keywords.some(k => before.includes(k))) continue;
     }
-    onMatch?.(ENTROPY_RULE_ID, m[0]);
-    out += text.slice(last, start) + token;
+    out += text.slice(last, start) + tokenForMatch(ENTROPY_RULE_ID, m[0], onMatch);
     last = end;
     count++;
   }
@@ -705,8 +712,7 @@ function redactTree(
   const redactWhole = (key: string) => {
     const value = obj[key];
     if (!isRedactableWhole(value)) return;
-    ctx?.onMatch?.(FIELD_RULE_ID, value);
-    setOwn(obj, key, tokenFor(FIELD_RULE_ID));
+    setOwn(obj, key, tokenForMatch(FIELD_RULE_ID, value, ctx?.onMatch));
     tally?.add([{ ruleId: FIELD_RULE_ID, count: 1 }]);
     changed = true;
   };
