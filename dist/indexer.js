@@ -297,9 +297,10 @@ export async function indexUnprocessed(concurrency = 1, noSummaries = false) {
                 const hw = db.prepare('SELECT COALESCE(MAX(line_end), 0) as maxLine FROM exchanges WHERE archive_path = ?').get(archivePath);
                 const maxIndexedLine = hw.maxLine;
                 try {
-                    // Refresh the (redacted) archive when the source has grown, then parse
-                    // the archive so the index only sees redacted text.
-                    copyIfNewer(sourcePath, archivePath, redactor, tally);
+                    // Refresh the (redacted) archive, then parse the archive so the index
+                    // only sees redacted text. Force the refresh once the file is indexed:
+                    // an append inside the mtime granularity would otherwise be skipped.
+                    copyIfNewer(sourcePath, archivePath, redactor, tally, maxIndexedLine > 0);
                     // Parse and filter to exchanges past the high-water mark
                     const exchanges = await parseConversation(archivePath, project, archivePath);
                     const newExchanges = maxIndexedLine > 0
