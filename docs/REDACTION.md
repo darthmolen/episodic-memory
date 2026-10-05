@@ -49,7 +49,7 @@ summary:
 | Rule ID | Catches |
 |---|---|
 | `private-key-block` | PEM and OpenSSH private keys, including truncated ones |
-| `connection-string-secret` | `AccountKey=`, `SharedAccessKey=`, `SharedAccessSignature=`, `Password=`, `Pwd=` in connection strings. Only the value is redacted; server, account, and database names stay. |
+| `connection-string-secret` | `AccountKey=`, `SharedAccessKey=`, `SharedAccessSignature=`, `Password=`, `Pwd=` in connection strings, in any case. Only the value is redacted; server, account, and database names stay. |
 | `azure-sas-token` | The `sig=` of a SAS URL. The URL and other parameters stay. |
 | `jwt` | JWTs, including Entra ID / Azure access tokens |
 | `anthropic-api-key`, `openai-api-key`, `github-token`, `aws-access-key-id`, `aws-secret-access-key`, `slack-token`, `google-api-key`, `npm-token` | Provider keys with a recognizable prefix |
