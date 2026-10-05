@@ -710,6 +710,14 @@ describe('redaction: structured JSON (field names as context, keys redacted)', (
     for (const line of lines) expect(redactJsonlLine(line, redactor, ctx), line).toBe(line);
   });
 
+  it('redacts a secret field whole when a text rule already redacted only part of it', () => {
+    const word = fake.chars('abcdefghijklmnopqrstuvwxyz', 12);
+    const line = JSON.stringify({ password: `${word} ${fake.jwt()}` });
+    const out = redactJsonlLine(line, redactor, ctx);
+    expect(out).not.toContain(word);
+    expect(JSON.parse(out).password).toBe('[REDACTED:secret-field]');
+  });
+
   it('is idempotent on structured redactions', () => {
     const line = JSON.stringify({ a: { clientSecret: fake.passphrase() }, b: [{ name: 'API_KEY', value: fake.passphrase() }] });
     const once = redactJsonlLine(line, redactor, ctx);
