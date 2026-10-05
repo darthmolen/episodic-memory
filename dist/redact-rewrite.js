@@ -28,60 +28,85 @@ function walk(dir) {
 function summaryPathFor(jsonlPath) {
     return jsonlPath.replace(/\.jsonl$/, SUMMARY_SUFFIX);
 }
+// In report mode each hit is written as its own numbered token, e.g.
+// `[REDACTED:jwt--hit3]`, so it can be found in the output exactly; tokens that
+// were already in the text have no number. Numbers are stripped for display.
+const HIT_TOKEN = /\[REDACTED:([a-z0-9][a-z0-9-]*?)--hit(\d+)\]/g;
+/** `value` with any numbered tokens in it replaced by the values they stand for. */
+function restoreHits(value, matches) {
+    return value.replace(HIT_TOKEN, (_token, _ruleId, n) => matches[Number(n)].value);
+}
 /**
- * Pair each value a rule redacted with its token in the redacted text and
- * report it. Tokens already in the original are skipped. Pairing is by rule and
- * order, so the context is right per rule but approximate when one rule hits
- * a line more than once around existing tokens.
+ * Report each hit with the redacted text around its token. A hit whose token
+ * was swallowed by a later one (a secret field redacted whole after a text rule
+ * hit part of it) is reported at the token that swallowed it.
  */
-function reportHits(original, redacted, matches, location, report) {
-    const queues = new Map();
-    for (const m of matches) {
-        const q = queues.get(m.ruleId);
-        if (q)
-            q.push(m.value);
-        else
-            queues.set(m.ruleId, [m.value]);
-    }
-    const preexisting = new Map();
-    for (const t of findRedactionTokens(original))
-        preexisting.set(t.ruleId, (preexisting.get(t.ruleId) ?? 0) + 1);
-    const oneLine = (text) => text.replace(/\s+/g, ' ');
+function reportHits(redacted, matches, location, report) {
+    let display = '';
+    let pos = 0;
+    const spans = new Map();
     for (const t of findRedactionTokens(redacted)) {
-        const skip = preexisting.get(t.ruleId) ?? 0;
-        if (skip > 0) {
-            preexisting.set(t.ruleId, skip - 1);
-            continue;
+        const numbered = /^(.*)--hit(\d+)$/.exec(t.ruleId);
+        display += redacted.slice(pos, t.start);
+        const shown = numbered ? `[REDACTED:${numbered[1]}]` : redacted.slice(t.start, t.end);
+        if (numbered && !spans.has(Number(numbered[2]))) {
+            spans.set(Number(numbered[2]), [display.length, display.length + shown.length]);
         }
-        const value = queues.get(t.ruleId)?.shift();
-        if (value === undefined)
-            continue;
-        const before = redacted.slice(Math.max(0, t.start - CONTEXT_BEFORE), t.start);
-        const after = redacted.slice(t.end, t.end + CONTEXT_AFTER);
+        display += shown;
+        pos = t.end;
+    }
+    display += redacted.slice(pos);
+    const spanOf = (n) => {
+        for (let i = n; i !== undefined; i = matches[i].absorbedBy) {
+            const span = spans.get(i);
+            if (span)
+                return span;
+        }
+        return undefined;
+    };
+    const oneLine = (text) => text.replace(/\s+/g, ' ');
+    const hits = matches.map((m, n) => ({ m, span: spanOf(n) }));
+    hits.sort((a, b) => (a.span?.[0] ?? Infinity) - (b.span?.[0] ?? Infinity));
+    for (const { m, span } of hits) {
+        const [start, end] = span ?? [0, 0];
+        const before = display.slice(Math.max(0, start - CONTEXT_BEFORE), start);
         report({
             location,
-            ruleId: t.ruleId,
-            shape: describeShape(value),
-            context: oneLine(`${t.start > CONTEXT_BEFORE ? '…' : ''}${before}${redacted.slice(t.start, t.end)}${after}`),
+            ruleId: m.ruleId,
+            shape: describeShape(m.value),
+            context: span
+                ? oneLine(`${start > CONTEXT_BEFORE ? '…' : ''}${before}${display.slice(start, end + CONTEXT_AFTER)}`)
+                : '',
         });
     }
+    return display;
 }
-/** Redact `text` with `run`, reporting each hit when `report` is set. */
-function redactReporting(text, ctx, location, report, run) {
+/**
+ * Redact with `run`, reporting each hit when `report` is set. Returns
+ * the redacted text with ordinary tokens either way.
+ */
+function redactReporting(ctx, location, report, run) {
     if (!report)
         return run(ctx);
     const matches = [];
-    const out = run({ ...ctx, onMatch: (ruleId, value) => matches.push({ ruleId, value }) });
-    if (matches.length > 0)
-        reportHits(text, out, matches, location, report);
-    return out;
+    const out = run({
+        ...ctx,
+        onMatch: (ruleId, value) => {
+            const n = matches.length;
+            for (const [, , k] of value.matchAll(HIT_TOKEN))
+                matches[Number(k)].absorbedBy = n;
+            matches.push({ ruleId, value: restoreHits(value, matches) });
+            return `[REDACTED:${ruleId}--hit${n}]`;
+        },
+    });
+    return matches.length > 0 ? reportHits(out, matches, location, report) : out;
 }
 /** Report every hit in a JSONL file, line by line. Writes nothing. */
 function reportFile(file, label, redactor, report) {
     const lines = fs.readFileSync(file, 'utf-8').split('\n');
     const ctx = { source: 'rewrite', path: file };
     lines.forEach((line, i) => {
-        redactReporting(line, ctx, `${label}:${i + 1}`, report, c => redactJsonlLine(line, redactor, c));
+        redactReporting(ctx, `${label}:${i + 1}`, report, c => redactJsonlLine(line, redactor, c));
     });
 }
 /** Redact one JSONL file in place. Returns the number of values redacted. */
@@ -109,6 +134,9 @@ function rewriteFileInPlace(file, redactor, dryRun, tally) {
 export async function rewriteArchive(options) {
     const { archiveDir, redactor, embed } = options;
     const dryRun = options.dryRun === true;
+    // Reporting reads files before redaction; after a real rewrite there'd be nothing to find.
+    if (options.report && !dryRun)
+        throw new Error('rewriteArchive: report requires dryRun');
     const log = options.log ?? (() => { });
     const tally = new FindingsTally();
     const result = {
@@ -165,7 +193,7 @@ export async function rewriteArchive(options) {
                     const rowTally = new FindingsTally();
                     const ctx = { source: 'index', path: row.archive_path };
                     const where = `index:${path.relative(archiveDir, row.archive_path)}#${row.id}`;
-                    const redactText = (text, field) => redactReporting(text, ctx, `${where} ${field}`, options.report, c => {
+                    const redactText = (text, field) => redactReporting(ctx, `${where} ${field}`, options.report, c => {
                         const r = redactor.redact(text, c);
                         rowTally.add(r.findings);
                         return r.text;
@@ -177,7 +205,7 @@ export async function rewriteArchive(options) {
                     for (const tool of tools) {
                         // tool_input is JSON text; redactJsonlLine keeps it valid JSON.
                         const toolInput = tool.tool_input;
-                        const input = toolInput === null ? null : redactReporting(toolInput, ctx, `${where} ${tool.tool_name} input`, options.report, c => redactJsonlLine(toolInput, redactor, c, rowTally));
+                        const input = toolInput === null ? null : redactReporting(ctx, `${where} ${tool.tool_name} input`, options.report, c => redactJsonlLine(toolInput, redactor, c, rowTally));
                         const output = tool.tool_result === null ? null : redactText(tool.tool_result, `${tool.tool_name} result`);
                         if (input !== tool.tool_input || output !== tool.tool_result) {
                             toolUpdates.push({ id: tool.id, input, result: output });

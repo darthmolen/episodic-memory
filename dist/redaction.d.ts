@@ -94,8 +94,10 @@ export interface RedactionContext {
     /**
      * Called with each value as it is redacted. For local review tooling
      * (`redact --report`) only: the value is the secret itself, so never log it.
+     * May return the token to write instead of `[REDACTED:<ruleId>]`, e.g. one
+     * numbered per hit; it must still have the token's shape.
      */
-    onMatch?: (ruleId: string, value: string) => void;
+    onMatch?: (ruleId: string, value: string) => string | void;
 }
 export interface RedactionFinding {
     ruleId: string;

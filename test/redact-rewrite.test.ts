@@ -209,6 +209,49 @@ describe('redact --rewrite backfill', () => {
     expect(archiveHit!.context).toContain('AccountKey=[REDACTED:connection-string-secret]');
     expect(hits.some(h => h.location.startsWith('index:') && h.location.includes(' user'))).toBe(true);
   });
+
+  it('report refuses to run without dryRun, since files would already be rewritten', async () => {
+    mkdirSync(archiveDir, { recursive: true });
+    await expect(rewriteArchive({
+      archiveDir, redactor: createRedactor(DEFAULT_REDACTION_CONFIG), embed, report: () => {},
+    })).rejects.toThrow(/dryRun/);
+  });
+
+  /** Dry-run report over one archive file holding `line`. */
+  async function reportLine(line: string) {
+    mkdirSync(join(archiveDir, '-work-x'), { recursive: true });
+    writeFileSync(join(archiveDir, '-work-x', 's.jsonl'), line + '\n');
+    const hits: Array<{ location: string; ruleId: string; shape: string; context: string }> = [];
+    await rewriteArchive({ archiveDir, redactor: createRedactor(DEFAULT_REDACTION_CONFIG), embed, dryRun: true, report: h => hits.push(h) });
+    return hits;
+  }
+
+  it('report pairs a new hit with its own token, not an earlier token of the same rule', async () => {
+    const pw = new FakeSecrets(912).chars('abcdefghijklmnopqrstuvwxyz', 14);
+    const hits = await reportLine(
+      JSON.stringify({ content: `first: Server=a;password=${pw}; later: Server=b;Password=[REDACTED:connection-string-secret];` })
+    );
+    expect(hits).toHaveLength(1);
+    expect(hits[0].shape).toMatch(/^len=14 a /);
+    expect(hits[0].context).toContain('first: Server=a;password=[REDACTED:connection-string-secret]');
+    expect(hits[0].context).not.toContain('--hit');
+  });
+
+  it('report keeps a hit swallowed by a whole secret field, and shapes the field from its original value', async () => {
+    const fake = new FakeSecrets(913);
+    const word = fake.chars('abcdefghijklmnopqrstuvwxyz', 9);
+    const jwt = fake.jwt();
+    const hits = await reportLine(JSON.stringify({ password: `${word} ${jwt}` }));
+
+    expect(hits.map(h => h.ruleId).sort()).toEqual(['jwt', 'secret-field']);
+    const field = hits.find(h => h.ruleId === 'secret-field')!;
+    expect(field.shape).toMatch(new RegExp(`^len=${word.length + 1 + jwt.length} `));
+    const swallowed = hits.find(h => h.ruleId === 'jwt')!;
+    expect(swallowed.shape).toMatch(new RegExp(`^len=${jwt.length} `));
+    expect(swallowed.context).toBe(field.context);
+    expect(field.context).toContain('"password":"[REDACTED:secret-field]"');
+    expect(JSON.stringify(hits)).not.toContain(word);
+  });
 });
 
 function expectNoSecretInCalls(calls: unknown[][], secrets: string[]) {
