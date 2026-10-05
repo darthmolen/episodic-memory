@@ -311,6 +311,18 @@ describe('redaction: idempotency', () => {
       }
     }
   });
+
+  it('a match that runs into an existing token redacts the part outside it, keeping the token', () => {
+    // Text already partly redacted, e.g. by an older rule set before `redact --rewrite`.
+    const redactor = defaults();
+    const fake = new FakeSecrets(12);
+    const prefix = fake.chars('abcdefghijklmnopqrstuvwxyz0123456789', 10);
+    const once = redactor.redact(`Server=db;Password=${prefix}[REDACTED:jwt];`, ctx);
+    expect(once.text).toBe('Server=db;Password=[REDACTED:connection-string-secret][REDACTED:jwt];');
+    const twice = redactor.redact(once.text, ctx);
+    expect(twice.text).toBe(once.text);
+    expect(twice.findings).toEqual([]);
+  });
 });
 
 describe('redaction: entropy fallback', () => {
