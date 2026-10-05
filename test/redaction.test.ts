@@ -54,6 +54,12 @@ describe('redaction: default rules (positive)', () => {
     expectRedacted(redactor, `use ${secret} as the client secret`, secret, 'azure-client-secret');
   });
 
+  it('azure-client-secret at the end of a sentence', () => {
+    const secret = fake.azureClientSecret();
+    const out = expectRedacted(redactor, `The client secret is ${secret}.`, secret, 'azure-client-secret');
+    expect(out.text).toBe('The client secret is [REDACTED:azure-client-secret].');
+  });
+
   it('azure-storage-key in `az storage account keys list` output', () => {
     const secret = fake.azureStorageKey();
     const text = `[\n  {\n    "keyName": "key1",\n    "permissions": "FULL",\n    "value": "${secret}"\n  }\n]`;
