@@ -279,6 +279,37 @@ function overlapsAny(spans, start, end) {
             return true;
     return false;
 }
+/**
+ * Rewrite text[start, end) keeping the existing tokens in it and replacing each
+ * stretch between them that has a letter or digit with `token`. Returns null
+ * when nothing outside the tokens needs redacting, which keeps this idempotent.
+ */
+function redactAroundTokens(text, spans, start, end, token) {
+    let out = '';
+    let pos = start;
+    let replaced = false;
+    const flush = (to) => {
+        const piece = text.slice(pos, to);
+        if (/[A-Za-z0-9]/.test(piece)) {
+            out += token;
+            replaced = true;
+        }
+        else {
+            out += piece;
+        }
+    };
+    for (const [s, e] of spans) {
+        if (e <= start || s >= end)
+            continue;
+        if (s > pos)
+            flush(s);
+        out += text.slice(Math.max(s, pos), Math.min(e, end));
+        pos = Math.min(e, end);
+    }
+    if (pos < end)
+        flush(end);
+    return replaced ? out : null;
+}
 function shannonEntropy(text) {
     const counts = new Map();
     for (const ch of text)
@@ -291,9 +322,10 @@ function shannonEntropy(text) {
     return entropy;
 }
 /**
- * Replace each accepted match (or its secretGroup) with a token. A candidate is
- * skipped when it overlaps an existing token (idempotency) or fully matches an
- * allowlist pattern.
+ * Replace each accepted match (or its secretGroup) with a token. A candidate
+ * that overlaps existing tokens keeps them, and only the text around them is
+ * redacted (so re-running is a no-op). A candidate is skipped when it fully
+ * matches an allowlist pattern.
  */
 function applyRule(text, rule, isAllowed) {
     const spans = text.includes(TOKEN_PREFIX) ? tokenSpans(text) : null;
@@ -313,10 +345,17 @@ function applyRule(text, rule, isAllowed) {
         const [start, end] = range;
         if (end <= start || start < last)
             continue;
-        if (spans && overlapsAny(spans, start, end))
-            continue;
         if (rule.useAllowlist && isAllowed(text.slice(start, end)))
             continue;
+        if (spans && overlapsAny(spans, start, end)) {
+            const rewritten = redactAroundTokens(text, spans, start, end, token);
+            if (rewritten === null)
+                continue;
+            out += text.slice(last, start) + rewritten;
+            last = end;
+            count++;
+            continue;
+        }
         out += text.slice(last, start) + token;
         last = end;
         count++;
