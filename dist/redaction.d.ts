@@ -91,6 +91,11 @@ export interface RedactionRulesFile {
 export interface RedactionContext {
     source: string;
     path: string;
+    /**
+     * Called with each value as it is redacted. For local review tooling
+     * (`redact --report`) only: the value is the secret itself, so never log it.
+     */
+    onMatch?: (ruleId: string, value: string) => void;
 }
 export interface RedactionFinding {
     ruleId: string;
@@ -135,6 +140,18 @@ export declare function loadRedactionConfig(file: RedactionRulesFile): Redaction
  * non-strict mode warns and returns null, so text passes through unredacted.
  */
 export declare function loadRedactor(env?: NodeJS.ProcessEnv, warn?: (message: string) => void): Redactor | null;
+/**
+ * Describe a value without revealing it: length, character classes and
+ * Shannon entropy (bits per char), e.g. "len=40 aA9- H=4.9". Lets someone
+ * reviewing hits tell a random key from a word or a placeholder.
+ */
+export declare function describeShape(value: string): string;
+/** Each `[REDACTED:<ruleId>]` token in `text`, left to right. */
+export declare function findRedactionTokens(text: string): Array<{
+    ruleId: string;
+    start: number;
+    end: number;
+}>;
 export declare function createRedactor(config: RedactionConfig): Redactor;
 /** Aggregates findings by rule id. Never holds matched values. */
 export declare class FindingsTally {

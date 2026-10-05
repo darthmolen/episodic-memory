@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `episodic-memory redact --rewrite` cleans data you indexed before upgrading. It redacts the archive and the search index in place, re-embeds only the messages that changed, and deletes summaries built from unredacted text so they regenerate. Use `--dry-run` to preview.
+- `episodic-memory redact --rewrite` cleans data you indexed before upgrading. It redacts the archive and the search index in place, re-embeds only the messages that changed, and deletes summaries built from unredacted text so they regenerate. Use `--dry-run` to preview (it writes nothing, not even a schema migration), and add `--report` to list each value it would redact, by location, rule and shape, without printing the value.
 - Custom redaction rules via `~/.config/superpowers/redaction-rules.json`, which extends the bundled defaults. Try rules with `episodic-memory redact --stdin`. See `docs/REDACTION.md`.
 - New settings: `EPISODIC_MEMORY_REDACTION` (`on`/`off`), `EPISODIC_MEMORY_REDACTION_RULES`, and `EPISODIC_MEMORY_REDACTION_STRICT`.
 
