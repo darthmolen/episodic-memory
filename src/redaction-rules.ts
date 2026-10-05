@@ -121,8 +121,8 @@ export const DEFAULT_REDACTION_CONFIG: RedactionConfig = {
     },
     {
       id: 'azure-client-secret',
-      description: 'Entra ID (Azure AD) application client secret: 3 chars, a digit, "Q~", 31-34 chars',
-      pattern: String.raw`(?<![A-Za-z0-9_~.-])[A-Za-z0-9_~.]{3}\dQ~[A-Za-z0-9_~.-]{31,34}(?![A-Za-z0-9_~.-])`,
+      description: 'Entra ID (Azure AD) application client secret: 3 chars, a digit, "Q~", 31-34 chars. A trailing "." may follow, so a secret ending a sentence still matches',
+      pattern: String.raw`(?<![A-Za-z0-9_~.-])[A-Za-z0-9_~.]{3}\dQ~[A-Za-z0-9_~.-]{31,34}(?![A-Za-z0-9_~-])`,
       keywords: ['q~'],
     },
     {
