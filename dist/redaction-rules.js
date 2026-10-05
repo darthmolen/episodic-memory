@@ -50,8 +50,9 @@ export const DEFAULT_REDACTION_CONFIG = {
         },
         {
             id: 'connection-string-secret',
-            description: 'Secret value inside an Azure/ADO.NET connection string; account, server and database names are kept',
-            pattern: String.raw `\b(?:AccountKey|SharedAccessKey|SharedAccessSignature|SharedSecret|ClientSecret|Password|Pwd)=(?![\[$<{%])([^;"'\s]+)`,
+            description: 'Secret value inside an Azure/ADO.NET connection string; account, server and database names are kept. Keywords are case-insensitive, as in ADO.NET; a path after Pwd= is the shell PWD variable and is kept',
+            pattern: String.raw `\b(?:(?:AccountKey|SharedAccessKey|SharedAccessSignature|SharedSecret|ClientSecret|Password)=|Pwd=(?![/~]))(?![\[$<{%])([^;"'\s]+)`,
+            flags: 'i',
             secretGroup: 1,
             keywords: ['accountkey', 'sharedaccess', 'sharedsecret', 'clientsecret', 'password', 'pwd'],
         },

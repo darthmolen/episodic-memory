@@ -93,6 +93,15 @@ describe('redaction: default rules (positive)', () => {
     expect(result.text).toContain('SharedAccessKeyName=RootManageSharedAccessKey');
   });
 
+  it('connection-string-secret keywords are case-insensitive, as in ADO.NET', () => {
+    // Letters only: secret-assignment needs a digit, so this rule is the only catch.
+    const pw = fake.chars('abcdefghijklmnopqrstuvwxyz', 19);
+    for (const keyword of ['password', 'PASSWORD', 'pwd', 'accountkey']) {
+      const result = expectRedacted(redactor, `Server=db;Database=app;${keyword}=${pw};`, pw, 'connection-string-secret');
+      expect(result.text).toContain(`${keyword}=[REDACTED:connection-string-secret];`);
+    }
+  });
+
   it('azure-sas-token redacts the sig while keeping the blob URL', () => {
     const sig = fake.sasSignature();
     const text = `https://contoso.blob.core.windows.net/backups/db.bak?sv=2022-11-02&ss=b&srt=co&sp=rl&se=2026-12-31T00:00:00Z&sig=${sig}`;
